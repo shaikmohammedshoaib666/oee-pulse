@@ -42,6 +42,8 @@ META_KEYS = (
     "schedule_note",
     "maintenance_analysis",
     "quality_analysis",
+    "column_mappings",
+    "finance_rates",
 )
 
 

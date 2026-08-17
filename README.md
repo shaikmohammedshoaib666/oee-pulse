@@ -18,15 +18,15 @@ Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto dow
 
 | Module | What it does |
 |--------|----------------|
-| **Upload & Integrate** | Multi-file upload (production, downtime, quality) + SQL-style 3-table joins (pandas / optional DuckDB) |
+| **Upload & Integrate** | Multi-file upload (production, downtime, quality) + SQL-style 3-table joins (pandas / optional DuckDB). **Saved column mapping** (messy / SAP-like headers → canonical fields, reused next upload). **SAP-style extract templates** (PP/PM/QM CSV + README) |
 | **Clean & Quality** | Industrial cleaning + statistical / ML quality checks |
-| **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns |
-| **Downtime Analysis** | Pareto of downtime codes, MTTR / MTBF lite, chronic machines |
-| **Maintenance** | Reliability overlay: asset risk, planned vs unplanned, inspect-this-week ranking, Availability hours lost |
+| **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns, **$ impact of lost hours**, **Availability hours \| $ lost \| PdM risk** |
+| **Downtime Analysis** | Pareto of downtime codes (minutes **and $**), MTTR / MTBF lite, chronic machines |
+| **Maintenance** | Reliability overlay: asset risk, planned vs unplanned, inspect-this-week ranking, Availability hours lost beside **$ and PdM risk** |
 | **Quality** | SPC / scrap overlay: FPY, defect Pareto, I-MR control limits, Cp/Cpk lite, killer-line cards |
-| **Insights** | Manager language + Optuna forecast + LLM/offline Q&A (Gemini/OpenAI) |
-| **Reports** | HTML + PDF export, email brief (SMTP or demo disk save) including maint + quality when data exists |
-| **Persistence** | SQLite + CSV session store — recent sessions in sidebar, reload last session |
+| **Insights** | Manager language + Optuna forecast + LLM/offline Q&A (Gemini/OpenAI), including **inspect this week using $ and risk** |
+| **Reports** | HTML + PDF export, email brief (SMTP or demo disk save) including maint, quality, and **lost-OEE $** |
+| **Persistence** | SQLite + CSV session store — recent sessions in sidebar, reload last session, **column mappings per plant** |
 
 ## Quick start (local)
 
@@ -87,7 +87,9 @@ PLANT_NAME = "North Plant"
 | `EMAIL_TO` / `SMTP_TO` | Default report recipient |
 | `SMTP_*` | Real SMTP when demo mode is off |
 | `GEMINI_API_KEY` / `OPENAI_API_KEY` | LLM Q&A (offline fallback always works) |
-| `PLANT_NAME` | Sidebar / reports |
+| `PLANT_NAME` | Sidebar / reports / saved column-mapping key |
+
+**In-app (not secrets):** sidebar **Lost-hour $ rates** — plant default `$ / hour`, optional `$ / good unit`, per-line rates, and a **Rates match finance** checkbox. Until that box is checked, dollar figures are labeled **management estimate**. Sample plant data ships with synthetic line rates (L1 $850 / L2 $1100 / L3 $720 per hour) and vibration / temp / current columns.
 
 ## Architecture
 
@@ -100,6 +102,9 @@ modules/
   data_integration.py  Multi-file load + chained joins
   quality_checks.py    Industrial clean + quality report
   oee_engine.py        OEE math + aggregations
+  column_mapping.py    Saved SAP/messy → canonical field mapping
+  sap_templates.py     PP/PM/QM extract CSV templates + README ZIP
+  finance_impact.py    $ / lost hour, Pareto in $, hours vs PdM risk
   downtime_analysis.py Pareto, MTTR/MTBF
   maintenance_analysis.py Reliability risk, planned vs unplanned, inspect-this-week
   quality_analysis.py  Scrap/FPY, defect Pareto, SPC lite, Cp/Cpk
@@ -109,7 +114,7 @@ modules/
   sample_data.py       Synthetic multi-line plant CSVs
 ```
 
-**Data flow:** Production + Downtime + Quality → join → clean/QC → OEE cockpit → downtime / maintenance / quality overlays → insights / Q&A → report / email.
+**Data flow:** Production + Downtime + Quality → column mapping (saved) → join → clean/QC → OEE cockpit ($ + PdM risk) → downtime / maintenance / quality overlays → insights / Q&A → report / email.
 
 ## Email automation MVP
 

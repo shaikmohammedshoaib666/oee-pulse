@@ -43,6 +43,12 @@ DEFAULTS: dict[str, Any] = {
     "clean_log": None,
     "maintenance_analysis": None,
     "quality_analysis": None,
+    "column_mappings": {},
+    "finance_rates": None,
+    "mapping_applied": False,
+    "raw_production_df": None,
+    "raw_downtime_df": None,
+    "raw_quality_df": None,
     "_session_hydrated": False,
 }
 
@@ -122,6 +128,9 @@ def collect_meta() -> dict[str, Any]:
         "schedule_note": st.session_state.get("schedule_note"),
         "maintenance_analysis": _analysis_for_meta(st.session_state.get("maintenance_analysis")),
         "quality_analysis": _analysis_for_meta(st.session_state.get("quality_analysis")),
+        "column_mappings": st.session_state.get("column_mappings") or {},
+        "finance_rates": st.session_state.get("finance_rates"),
+        "mapping_applied": bool(st.session_state.get("mapping_applied")),
     }
 
 
@@ -164,6 +173,9 @@ def load_persisted_session(session_id: str) -> bool:
         "schedule_note",
         "maintenance_analysis",
         "quality_analysis",
+        "column_mappings",
+        "finance_rates",
+        "mapping_applied",
     ):
         if key in meta and meta[key] is not None:
             st.session_state[key] = meta[key]
@@ -178,3 +190,16 @@ def append_chat(role: str, content: str, source: str = "") -> None:
     hist = list(st.session_state.get("chat_history") or [])
     hist.append({"role": role, "content": content, "source": source})
     st.session_state.chat_history = hist[-40:]
+
+
+def get_finance_rates() -> dict:
+    from modules.finance_impact import default_finance_rates, normalize_rates
+
+    raw = st.session_state.get("finance_rates")
+    if not isinstance(raw, dict):
+        rates = default_finance_rates()
+        st.session_state.finance_rates = rates
+        return rates
+    rates = normalize_rates(raw)
+    st.session_state.finance_rates = rates
+    return rates

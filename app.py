@@ -12,6 +12,14 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from modules.config_secrets import demo_email_mode, get_email_to, llm_status
+from modules.column_mapping import (
+    CANONICAL_FIELDS,
+    SKIP_SOURCE,
+    apply_mapping,
+    resolve_mapping,
+    save_mapping,
+    suggest_mapping,
+)
 from modules.data_integration import (
     JOIN_TYPES,
     join_many,
@@ -20,7 +28,13 @@ from modules.data_integration import (
     suggest_join_keys,
     try_duckdb_join,
 )
-from modules.downtime_analysis import downtime_pareto, mttr_mtbf, top_chronic_machines
+from modules.downtime_analysis import mttr_mtbf, top_chronic_machines
+from modules.finance_impact import (
+    asset_cost_risk_table,
+    pareto_with_dollars,
+    plant_dollar_impact,
+    rate_disclaimer,
+)
 from modules.insights_engine import ask_oee_question, generate_insights
 from modules.maintenance_analysis import analyze_maintenance, frame_ok as maint_frame_ok
 from modules.oee_engine import oee_summary, prepare_oee_frame
@@ -34,12 +48,14 @@ from modules.reports import (
     write_html_report,
     write_pdf_report,
 )
-from modules.sample_data import generate_sample_plant
+from modules.sample_data import demo_finance_rates, ensure_demo_sensors, generate_sample_plant
+from modules.sap_templates import templates_zip_bytes
 from modules import session_store
 from ui.session import (
     append_chat,
     ensure_session_id,
     get_active_frame,
+    get_finance_rates,
     init_session,
     load_persisted_session,
     persist_current_session,
@@ -98,6 +114,10 @@ def load_sample_into_session() -> None:
     st.session_state.production_df = pd.read_csv(SAMPLE_DIR / "production_logs.csv")
     st.session_state.downtime_df = pd.read_csv(SAMPLE_DIR / "downtime_events.csv")
     st.session_state.quality_df = pd.read_csv(SAMPLE_DIR / "quality_rejects.csv")
+    st.session_state.production_df = ensure_demo_sensors(st.session_state.production_df)
+    st.session_state.raw_production_df = st.session_state.production_df.copy()
+    st.session_state.raw_downtime_df = st.session_state.downtime_df.copy()
+    st.session_state.raw_quality_df = st.session_state.quality_df.copy()
     for col in ("shift_date", "start_time", "end_time"):
         for key in ("production_df", "downtime_df", "quality_df"):
             df = st.session_state[key]
@@ -121,9 +141,106 @@ def load_sample_into_session() -> None:
     st.session_state.insights = None
     st.session_state.join_logs = logs
     st.session_state.sample_loaded = True
+    st.session_state.finance_rates = demo_finance_rates()
+    st.session_state.column_mappings = st.session_state.get("column_mappings") or {}
     ensure_session_id()
     st.session_state.session_title = "Sample plant"
     persist_current_session(title="Sample plant")
+
+
+def _plant_name() -> str:
+    return os.getenv("PLANT_NAME", "North Plant")
+
+
+def _raw_key(table_kind: str) -> str:
+    return {"production": "raw_production_df", "downtime": "raw_downtime_df", "quality": "raw_quality_df"}[table_kind]
+
+
+def _work_key(table_kind: str) -> str:
+    return {"production": "production_df", "downtime": "downtime_df", "quality": "quality_df"}[table_kind]
+
+
+def _map_uploaded(df: pd.DataFrame, table_kind: str) -> pd.DataFrame:
+    """Apply saved or suggested mapping so engines always see canonical names."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    plant = _plant_name()
+    stored = (st.session_state.get("column_mappings") or {}).get(table_kind)
+    mapping = stored if isinstance(stored, dict) and stored else resolve_mapping(list(df.columns), plant, table_kind)
+    mapped = apply_mapping(df, mapping)
+    maps = dict(st.session_state.get("column_mappings") or {})
+    maps[table_kind] = mapping
+    st.session_state.column_mappings = maps
+    return mapped
+
+
+def _render_mapping_editor(df: pd.DataFrame, table_kind: str) -> None:
+    raw = st.session_state.get(_raw_key(table_kind))
+    source = raw if isinstance(raw, pd.DataFrame) and not raw.empty else df
+    if source is None or not isinstance(source, pd.DataFrame) or source.empty:
+        st.info(f"Upload {table_kind} data first.")
+        return
+    plant = _plant_name()
+    cols = [SKIP_SOURCE] + [str(c) for c in source.columns]
+    current = (st.session_state.get("column_mappings") or {}).get(table_kind)
+    if not isinstance(current, dict) or not current:
+        current = resolve_mapping(list(source.columns), plant, table_kind)
+    st.caption(f"Map messy / SAP-like headers → canonical fields for **{table_kind}**. Saved per plant (`{plant}`).")
+    picks: dict[str, str] = {}
+    left, right = st.columns(2)
+    half = (len(CANONICAL_FIELDS) + 1) // 2
+    for i, (canon, label, _kind) in enumerate(CANONICAL_FIELDS):
+        default = current.get(canon, SKIP_SOURCE)
+        if default not in cols:
+            default = SKIP_SOURCE
+        target = left if i < half else right
+        with target:
+            picks[canon] = st.selectbox(
+                f"{label} → `{canon}`",
+                options=cols,
+                index=cols.index(default) if default in cols else 0,
+                key=f"map_{table_kind}_{canon}",
+            )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button(f"Apply {table_kind} mapping", type="primary", key=f"apply_map_{table_kind}"):
+            mapping = {k: v for k, v in picks.items() if v and v != SKIP_SOURCE}
+            mapped = apply_mapping(source, mapping)
+            st.session_state[_work_key(table_kind)] = mapped
+            maps = dict(st.session_state.get("column_mappings") or {})
+            maps[table_kind] = mapping
+            st.session_state.column_mappings = maps
+            save_mapping(
+                plant,
+                table_kind,
+                mapping,
+                session_id=st.session_state.get("session_id"),
+                source_columns=list(source.columns),
+            )
+            persist_current_session()
+            st.success(f"Applied and saved {len(mapping)} field mappings for {table_kind}.")
+            st.rerun()
+    with c2:
+        if st.button(f"Suggest {table_kind} mapping", key=f"suggest_map_{table_kind}"):
+            maps = dict(st.session_state.get("column_mappings") or {})
+            maps[table_kind] = suggest_mapping(list(source.columns))
+            st.session_state.column_mappings = maps
+            st.rerun()
+    with c3:
+        if st.button(f"Save {table_kind} mapping", key=f"save_map_{table_kind}"):
+            mapping = {k: v for k, v in picks.items() if v and v != SKIP_SOURCE}
+            save_mapping(
+                plant,
+                table_kind,
+                mapping,
+                session_id=st.session_state.get("session_id"),
+                source_columns=list(source.columns),
+            )
+            maps = dict(st.session_state.get("column_mappings") or {})
+            maps[table_kind] = mapping
+            st.session_state.column_mappings = maps
+            persist_current_session()
+            st.success("Mapping saved — next upload for this plant reuses it.")
 
 
 def _render_chat_qa(frame: pd.DataFrame, key_prefix: str = "qa") -> None:
@@ -162,6 +279,7 @@ def _render_chat_qa(frame: pd.DataFrame, key_prefix: str = "qa") -> None:
             quality=st.session_state.quality_df,
             insights=st.session_state.insights,
             history=st.session_state.chat_history,
+            finance_rates=get_finance_rates(),
         )
         append_chat("assistant", result.get("answer", ""), source=result.get("source", ""))
         persist_current_session()
@@ -228,6 +346,59 @@ with st.sidebar:
         "Demo email: "
         + ("on (disk save)" if demo_email_mode() else "off (SMTP)")
     )
+    st.divider()
+    st.markdown("**Lost-hour $ rates**")
+    rates = get_finance_rates()
+    plant_usd = st.number_input(
+        "$ / hour (plant default)",
+        min_value=0.0,
+        value=float(rates.get("plant_usd_per_hour") or 850.0),
+        step=25.0,
+        key="fin_plant_usd",
+    )
+    unit_usd = st.number_input(
+        "$ / good unit (optional)",
+        min_value=0.0,
+        value=float(rates.get("usd_per_good_unit") or 0.0),
+        step=0.5,
+        key="fin_unit_usd",
+        help="If > 0, quality loss uses scrap × this rate instead of hour-equivalents.",
+    )
+    include_pq = st.checkbox(
+        "Include Performance & Quality hour-equivalents",
+        value=bool(rates.get("include_performance_quality_hours", True)),
+        key="fin_include_pq",
+    )
+    match_fin = st.checkbox(
+        "Rates match finance",
+        value=bool(rates.get("rates_match_finance")),
+        key="fin_match",
+        help="Uncheck unless these rates come from finance. UI labels them as a management estimate.",
+    )
+    line_rates = dict(rates.get("line_usd_per_hour") or {})
+    prod = st.session_state.get("production_df")
+    line_ids = []
+    if isinstance(prod, pd.DataFrame) and not prod.empty and "line_id" in prod.columns:
+        line_ids = sorted(str(x) for x in prod["line_id"].dropna().unique().tolist())
+    if not line_ids:
+        line_ids = sorted(line_rates.keys()) or ["L1", "L2", "L3"]
+    with st.expander("Per-line $ / hour"):
+        for lid in line_ids:
+            line_rates[lid] = st.number_input(
+                f"{lid} $ / hour",
+                min_value=0.0,
+                value=float(line_rates.get(lid, plant_usd)),
+                step=25.0,
+                key=f"fin_line_{lid}",
+            )
+    st.session_state.finance_rates = {
+        "plant_usd_per_hour": float(plant_usd),
+        "usd_per_good_unit": float(unit_usd),
+        "line_usd_per_hour": line_rates,
+        "rates_match_finance": bool(match_fin),
+        "include_performance_quality_hours": bool(include_pq),
+    }
+    st.caption(rate_disclaimer(st.session_state.finance_rates))
     cur = st.session_state.get("session_id")
     if cur:
         st.caption(f"Session: {st.session_state.get('session_title') or cur}")
@@ -240,7 +411,8 @@ hero()
 if page == "Upload & Integrate":
     st.subheader("Upload & Integrate")
     st.write(
-        "Upload production logs, downtime events, and quality/rejects — or load synthetic plant data."
+        "Upload production logs, downtime events, and quality/rejects — or load synthetic plant data. "
+        "Map SAP-like headers once; the mapping is saved for this plant."
     )
 
     c1, c2, c3 = st.columns(3)
@@ -252,13 +424,19 @@ if page == "Upload & Integrate":
         up_q = st.file_uploader("Rejects / quality", type=["csv", "xlsx", "tsv", "json"], key="up_q")
 
     if up_prod:
-        st.session_state.production_df = load_tabular_file(up_prod)
+        raw = load_tabular_file(up_prod)
+        st.session_state.raw_production_df = raw
+        st.session_state.production_df = _map_uploaded(raw, "production")
     if up_dt:
-        st.session_state.downtime_df = load_tabular_file(up_dt)
+        raw = load_tabular_file(up_dt)
+        st.session_state.raw_downtime_df = raw
+        st.session_state.downtime_df = _map_uploaded(raw, "downtime")
     if up_q:
-        st.session_state.quality_df = load_tabular_file(up_q)
+        raw = load_tabular_file(up_q)
+        st.session_state.raw_quality_df = raw
+        st.session_state.quality_df = _map_uploaded(raw, "quality")
 
-    tabs = st.tabs(["Production", "Downtime", "Quality", "Join"])
+    tabs = st.tabs(["Production", "Downtime", "Quality", "Join", "Column mapping", "SAP templates"])
     with tabs[0]:
         if st.session_state.production_df is not None:
             st.dataframe(st.session_state.production_df.head(100), use_container_width=True)
@@ -353,6 +531,31 @@ if page == "Upload & Integrate":
             if st.session_state.integrated_df is not None:
                 st.dataframe(st.session_state.integrated_df.head(50), use_container_width=True)
 
+    with tabs[4]:
+        st.write("Saved column mapping is tied to this plant (and session). Engines use canonical names after Apply.")
+        sub = st.tabs(["Production fields", "Downtime fields", "Quality fields"])
+        with sub[0]:
+            _render_mapping_editor(st.session_state.production_df, "production")
+        with sub[1]:
+            _render_mapping_editor(st.session_state.downtime_df, "downtime")
+        with sub[2]:
+            _render_mapping_editor(st.session_state.quality_df, "quality")
+
+    with tabs[5]:
+        st.write(
+            "Download SAP-style PP / PM / QM extract templates (CSV headers typical of work-center, "
+            "equipment, and inspection-lot exports) plus a short README of expected columns."
+        )
+        zip_bytes = templates_zip_bytes()
+        st.download_button(
+            "Download SAP extract templates (ZIP)",
+            data=zip_bytes,
+            file_name="oee_pulse_sap_extract_templates.zip",
+            mime="application/zip",
+            type="primary",
+        )
+        st.caption("Not a live SAP connector — export from SAP / SQVI / CDS into this shape, then map columns.")
+
 
 # ── Clean & Quality ───────────────────────────────────────────────────────────
 elif page == "Clean & Quality":
@@ -405,12 +608,20 @@ elif page == "OEE Cockpit":
         summary = oee_summary(frame)
         st.session_state.oee_summary = summary
         plant = summary["plant"]
+        rates = get_finance_rates()
+        impact = plant_dollar_impact(frame, st.session_state.downtime_df, rates)
         a, b, c, d, e = st.columns(5)
         a.metric("OEE", f"{float(plant.get('oee', 0))*100:.1f}%")
         b.metric("Availability", f"{float(plant.get('availability', 0))*100:.1f}%")
         c.metric("Performance", f"{float(plant.get('performance', 0))*100:.1f}%")
         d.metric("Quality", f"{float(plant.get('quality', 0))*100:.1f}%")
         e.metric("Gap to 85%", f"{summary['world_class_gap']*100:.1f} pts")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Avail. hours lost", f"{float(impact.get('availability_hours') or 0):.1f} h")
+        f2.metric("Avail. $ lost", f"${float(impact.get('availability_usd') or 0):,.0f}")
+        f3.metric("Total $ impact", f"${float(impact.get('total_usd') or 0):,.0f}")
+        f4.metric("$ / hour", f"${float(impact.get('plant_usd_per_hour') or 0):,.0f}")
+        st.caption(impact.get("disclaimer") or rate_disclaimer(rates))
 
         work = summary["frame"]
         loss_df = pd.DataFrame(
@@ -482,6 +693,52 @@ elif page == "OEE Cockpit":
             fig.update_layout(title="Shift breakdown", yaxis_tickformat=".0%")
             st.plotly_chart(_style_fig(fig), use_container_width=True)
 
+        matrix, iso_meta = asset_cost_risk_table(
+            st.session_state.downtime_df,
+            oee_frame=frame,
+            production=st.session_state.production_df,
+            rates=rates,
+        )
+        if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+            st.write("**Availability hours lost | $ lost | PdM / failure risk**")
+            st.caption(
+                "Prioritize assets that are both costly and likely to fail suddenly. "
+                + (impact.get("label") or "Management estimate")
+            )
+            show = matrix[
+                [
+                    c
+                    for c in (
+                        "machine_id",
+                        "line_id",
+                        "availability_hours_lost",
+                        "usd_lost",
+                        "remaining_risk",
+                        "priority_score",
+                        "action",
+                        "why",
+                    )
+                    if c in matrix.columns
+                ]
+            ]
+            fig = px.scatter(
+                matrix,
+                x="availability_hours_lost",
+                y="remaining_risk",
+                size="usd_lost",
+                color="line_id" if "line_id" in matrix.columns else None,
+                hover_name="machine_id",
+                title="Hours lost vs PdM risk (bubble size = $ lost)",
+                color_discrete_sequence=["#64748b", "#94a3b8", "#f59e0b", "#e2e8f0"],
+            )
+            st.plotly_chart(_style_fig(fig), use_container_width=True)
+            st.dataframe(show, use_container_width=True)
+            if iso_meta.get("ok"):
+                st.caption(
+                    f"IsolationForest sensors {iso_meta.get('features')} · "
+                    f"{iso_meta.get('anomaly_count')} anomalous rows / {iso_meta.get('rows')}"
+                )
+
         with st.expander("Row-level OEE detail"):
             st.dataframe(prepare_oee_frame(frame).head(200), use_container_width=True)
 
@@ -503,8 +760,8 @@ elif page == "Downtime Analysis":
 
     if dt is not None:
         try:
-            pareto = downtime_pareto(dt)
-            if pareto.empty:
+            pareto = pareto_with_dollars(dt, get_finance_rates())
+            if pareto is None or not isinstance(pareto, pd.DataFrame) or pareto.empty:
                 st.warning("No downtime minutes to chart.")
             else:
                 fig = go.Figure()
@@ -527,7 +784,7 @@ elif page == "Downtime Analysis":
                     )
                 )
                 fig.update_layout(
-                    title="Downtime Pareto",
+                    title="Downtime Pareto ($ on hover)",
                     yaxis=dict(title="Minutes"),
                     yaxis2=dict(
                         title="Cumulative %",
@@ -538,6 +795,7 @@ elif page == "Downtime Analysis":
                     ),
                 )
                 st.plotly_chart(_style_fig(fig), use_container_width=True)
+                st.caption(rate_disclaimer(get_finance_rates()) + " Top reasons include $ lost using line (or plant) $/hour.")
                 st.dataframe(pareto, use_container_width=True)
         except Exception as exc:
             st.error(f"Pareto failed: {exc}")
@@ -644,6 +902,44 @@ elif page == "Maintenance":
                 else:
                     st.caption(f"Sensor IsolationForest skipped: {iso.get('reason', 'no numeric sensors')}")
                 st.dataframe(inspect, use_container_width=True)
+
+            matrix, iso_cr = asset_cost_risk_table(
+                dt,
+                oee_frame=get_active_frame(),
+                production=st.session_state.production_df,
+                rates=get_finance_rates(),
+            )
+            if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+                st.write("**Availability hours lost | $ lost | PdM risk**")
+                fig = px.scatter(
+                    matrix,
+                    x="usd_lost",
+                    y="remaining_risk",
+                    size="availability_hours_lost",
+                    color="line_id" if "line_id" in matrix.columns else None,
+                    hover_name="machine_id",
+                    title="Cost vs sudden-failure risk (bubble = hours lost)",
+                    color_discrete_sequence=["#64748b", "#94a3b8", "#f59e0b"],
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+                show = matrix[
+                    [
+                        c
+                        for c in (
+                            "machine_id",
+                            "line_id",
+                            "availability_hours_lost",
+                            "usd_lost",
+                            "remaining_risk",
+                            "priority_score",
+                            "action",
+                            "why",
+                        )
+                        if c in matrix.columns
+                    ]
+                ]
+                st.dataframe(show, use_container_width=True)
+                st.caption(rate_disclaimer(get_finance_rates()))
 
             assets = maint.get("asset_risk")
             if isinstance(assets, pd.DataFrame) and not assets.empty:
@@ -842,7 +1138,10 @@ elif page == "Insights":
         use_optuna = st.checkbox("Enable Optuna hyperparameter tuning", value=True)
         if st.button("Generate manager insights", type="primary"):
             insights = generate_insights(
-                frame, st.session_state.downtime_df, st.session_state.quality_df
+                frame,
+                st.session_state.downtime_df,
+                st.session_state.quality_df,
+                finance_rates=get_finance_rates(),
             )
             st.session_state.insights = insights
             st.session_state.forecast = tune_and_forecast(
@@ -913,7 +1212,10 @@ elif page == "Reports":
         insights = st.session_state.get("insights")
         if not insights:
             insights = generate_insights(
-                frame, st.session_state.downtime_df, st.session_state.quality_df
+                frame,
+                st.session_state.downtime_df,
+                st.session_state.quality_df,
+                finance_rates=get_finance_rates(),
             )
             st.session_state.insights = insights
 
@@ -922,9 +1224,20 @@ elif page == "Reports":
         reliability = {}
         maint = None
         qual = None
+        rates = get_finance_rates()
+        finance = plant_dollar_impact(frame, st.session_state.downtime_df, rates)
+        cost_risk_rows = []
+        matrix, _ = asset_cost_risk_table(
+            st.session_state.downtime_df,
+            oee_frame=frame,
+            production=st.session_state.production_df,
+            rates=rates,
+        )
+        if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+            cost_risk_rows = matrix.head(8).to_dict("records")
         if maint_frame_ok(st.session_state.downtime_df):
             try:
-                pareto_rows = downtime_pareto(st.session_state.downtime_df).to_dict("records")
+                pareto_rows = pareto_with_dollars(st.session_state.downtime_df, rates).to_dict("records")
             except Exception:
                 pareto_rows = []
             reliability = mttr_mtbf(st.session_state.downtime_df)
@@ -957,6 +1270,8 @@ elif page == "Reports":
             qa_answer=last_assistant[:1200],
             maintenance=maint,
             quality=qual,
+            finance=finance,
+            cost_risk_rows=cost_risk_rows,
         )
         st.session_state.last_report_html = html
         st.components.v1.html(html, height=520, scrolling=True)
@@ -987,6 +1302,8 @@ elif page == "Reports":
                         "pareto_rows": pareto_rows,
                         "maintenance": maint,
                         "quality": qual,
+                        "finance": finance,
+                        "cost_risk_rows": cost_risk_rows,
                     },
                     ROOT / "reports" / "output",
                 )

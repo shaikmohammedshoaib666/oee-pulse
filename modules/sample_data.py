@@ -154,14 +154,56 @@ def generate_sample_plant(
     production = production.merge(agg, on=["shift_date", "shift", "line_id", "machine_id"], how="left")
     production["downtime_minutes"] = production["downtime_minutes"].fillna(0)
 
+    production = ensure_demo_sensors(production)
     production.to_csv(out / "production_logs.csv", index=False)
     downtime.to_csv(out / "downtime_events.csv", index=False)
     quality.to_csv(out / "quality_rejects.csv", index=False)
 
-    return {"production": production, "downtime": downtime, "quality": quality}
+    return {
+        "production": production,
+        "downtime": downtime,
+        "quality": quality,
+        "finance_rates": demo_finance_rates(),
+    }
+
+
+def demo_finance_rates() -> dict:
+    """Synthetic $/hour so the sample plant demos $ impact without extra files."""
+    from modules.finance_impact import default_finance_rates
+
+    return default_finance_rates()
+
+
+def ensure_demo_sensors(production: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
+    """Add vibration / temp / current if a plant extract is missing them (demo only)."""
+    if production is None or not isinstance(production, pd.DataFrame) or production.empty:
+        return production if isinstance(production, pd.DataFrame) else pd.DataFrame()
+    out = production.copy()
+    rng = np.random.default_rng(seed)
+    n = len(out)
+    line = out["line_id"] if "line_id" in out.columns else None
+    machine = out["machine_id"].astype(str) if "machine_id" in out.columns else None
+    if "vibration_rms" not in out.columns:
+        base = np.full(n, 2.4)
+        if machine is not None:
+            base = np.where(machine.str.endswith("03"), 6.4, base)
+        if line is not None:
+            base = np.where(line.astype(str) == "L3", np.maximum(base, 4.8), base)
+        out["vibration_rms"] = np.clip(rng.normal(base, 0.7), 0.4, 12.0).round(3)
+    if "temp_c" not in out.columns:
+        tbase = np.full(n, 47.0)
+        if line is not None:
+            tbase = np.where(line.astype(str) == "L3", 63.0, tbase)
+        out["temp_c"] = np.clip(rng.normal(tbase, 4.5), 30.0, 95.0).round(2)
+    if "motor_current_a" not in out.columns:
+        out["motor_current_a"] = np.clip(rng.normal(12.5, 1.6, n), 6.0, 22.0).round(2)
+    return out
 
 
 if __name__ == "__main__":
     data = generate_sample_plant()
     for k, v in data.items():
-        print(f"{k}: {v.shape}")
+        if hasattr(v, "shape"):
+            print(f"{k}: {v.shape}")
+        else:
+            print(f"{k}: {v}")

@@ -24,7 +24,9 @@ from modules.quality_checks import find_col
 SYSTEM_PROMPT = (
     "You are OEE Pulse, an Industry 4.0 co-pilot for plant managers. "
     "Answer using the provided OEE, downtime Pareto, MTTR/MTBF, maintenance risk, "
+    "$ impact of lost hours (management estimate unless rates match finance), "
     "quality scrap/FPY/SPC, and line/machine metrics. "
+    "When asked what to inspect this week, use BOTH dollar loss and PdM/failure risk. "
     "Use clear manager language. Be concise, actionable, and grounded in the numbers. "
     "Do not invent machines or percentages that are not in the context."
 )
@@ -34,6 +36,7 @@ def generate_insights(
     production_oee: pd.DataFrame,
     downtime: pd.DataFrame | None = None,
     quality: pd.DataFrame | None = None,
+    finance_rates: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return prioritized insights in plant-manager language."""
     insights: list[dict[str, Any]] = []
@@ -198,6 +201,43 @@ def generate_insights(
             }
         )
 
+    try:
+        from modules.finance_impact import (
+            asset_cost_risk_table,
+            inspect_this_week_narrative,
+            plant_dollar_impact,
+        )
+
+        impact = plant_dollar_impact(production_oee, downtime, finance_rates)
+        if impact.get("ok"):
+            insights.append(
+                {
+                    "priority": "high",
+                    "title": f"Lost OEE dollars ({impact.get('label')})",
+                    "message": (
+                        f"Availability loss is {float(impact.get('availability_hours') or 0):.1f} hours "
+                        f"(${float(impact.get('availability_usd') or 0):,.0f}). "
+                        f"Including speed/quality hour-equivalents, estimated impact is "
+                        f"${float(impact.get('total_usd') or 0):,.0f} at "
+                        f"${float(impact.get('plant_usd_per_hour') or 0):,.0f}/hour. "
+                        f"{impact.get('disclaimer')}"
+                    ),
+                }
+            )
+        matrix, _ = asset_cost_risk_table(
+            downtime, oee_frame=production_oee, production=production_oee, rates=finance_rates
+        )
+        if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+            insights.append(
+                {
+                    "priority": "high",
+                    "title": "Inspect this week ($ and PdM risk)",
+                    "message": inspect_this_week_narrative(matrix, finance_rates),
+                }
+            )
+    except Exception:
+        pass
+
     if maint_frame_ok(downtime):
         try:
             maint = analyze_maintenance(downtime, production=production_oee, oee_frame=production_oee)
@@ -225,6 +265,7 @@ def build_metrics_context(
     downtime: pd.DataFrame | None = None,
     insights: list[dict[str, Any]] | None = None,
     quality: pd.DataFrame | None = None,
+    finance_rates: dict[str, Any] | None = None,
 ) -> str:
     """Compact grounded context for LLM / offline answers."""
     summary = oee_summary(frame)
@@ -270,6 +311,33 @@ def build_metrics_context(
     if insights:
         for i in insights[:6]:
             lines.append(f"Insight [{i.get('priority')}]: {i.get('message')}")
+
+    try:
+        from modules.finance_impact import asset_cost_risk_table, plant_dollar_impact
+
+        impact = plant_dollar_impact(frame, downtime, finance_rates)
+        if impact.get("ok"):
+            lines.append(
+                f"$ impact ({impact.get('label')}): Availability ${float(impact.get('availability_usd') or 0):,.0f} "
+                f"({float(impact.get('availability_hours') or 0):.1f} h) · "
+                f"total ${float(impact.get('total_usd') or 0):,.0f} at "
+                f"${float(impact.get('plant_usd_per_hour') or 0):,.0f}/h. "
+                f"{impact.get('disclaimer')}"
+            )
+        matrix, _ = asset_cost_risk_table(
+            downtime, oee_frame=frame, production=frame, rates=finance_rates, top_n=6
+        )
+        if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+            for _, r in matrix.head(5).iterrows():
+                lines.append(
+                    f"Asset {r.get('machine_id')} line {r.get('line_id')}: "
+                    f"avail hours lost={float(r.get('availability_hours_lost') or 0):.1f} "
+                    f"$lost={float(r.get('usd_lost') or 0):.0f} "
+                    f"PdM risk={float(r.get('remaining_risk') or 0):.0f} "
+                    f"priority={float(r.get('priority_score') or 0):.0f}"
+                )
+    except Exception:
+        pass
 
     if maint_frame_ok(downtime):
         try:
@@ -327,11 +395,12 @@ def _offline_answer(
     downtime: pd.DataFrame | None,
     insights: list[dict[str, Any]] | None,
     quality: pd.DataFrame | None = None,
+    finance_rates: dict[str, Any] | None = None,
 ) -> str:
     q = (question or "").lower()
     summary = oee_summary(frame)
     plant = summary["plant"]
-    insight_list = insights or generate_insights(frame, downtime, quality)
+    insight_list = insights or generate_insights(frame, downtime, quality, finance_rates)
 
     if any(w in q for w in ("oee", "overall equipment", "how are we", "plant status", "summary")):
         return (
@@ -369,6 +438,26 @@ def _offline_answer(
             "hours lost",
             "availability loss",
             "maintenance",
+            "this week",
+            "failure risk",
+            "pdm",
+            "dollar",
+            "$",
+            "costly",
+        )
+    )
+    money_intent = any(
+        w in q
+        for w in (
+            "dollar",
+            "$",
+            "cost",
+            "usd",
+            "lost hour",
+            "lost oee",
+            "finance",
+            "money",
+            "impact",
         )
     )
 
@@ -419,21 +508,55 @@ def _offline_answer(
         except Exception as exc:
             return f"Quality overlay unavailable ({exc}). Load rejects / quality data."
 
+    if money_intent:
+        try:
+            from modules.finance_impact import (
+                asset_cost_risk_table,
+                inspect_this_week_narrative,
+                plant_dollar_impact,
+            )
+
+            impact = plant_dollar_impact(frame, downtime, finance_rates)
+            if any(w in q for w in ("inspect", "this week", "risk")):
+                matrix, _ = asset_cost_risk_table(
+                    downtime if downtime is not None else frame,
+                    oee_frame=frame,
+                    production=frame,
+                    rates=finance_rates,
+                )
+                if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+                    return inspect_this_week_narrative(matrix, finance_rates)
+            if impact.get("ok"):
+                return (
+                    f"{impact.get('label')}: Availability loss is "
+                    f"{float(impact.get('availability_hours') or 0):.1f} hours "
+                    f"(${float(impact.get('availability_usd') or 0):,.0f}). "
+                    f"Speed + quality hour-equivalents bring the total to "
+                    f"${float(impact.get('total_usd') or 0):,.0f} at "
+                    f"${float(impact.get('plant_usd_per_hour') or 0):,.0f}/hour. "
+                    f"{impact.get('disclaimer')}"
+                )
+        except Exception as exc:
+            return f"Dollar impact unavailable ({exc})."
+
     if maint_intent and maint_frame_ok(downtime if downtime is not None else frame):
         try:
+            from modules.finance_impact import asset_cost_risk_table, inspect_this_week_narrative
+
+            if any(w in q for w in ("inspect", "remaining risk", "this week", "pdm", "costly", "failure")):
+                matrix, _ = asset_cost_risk_table(
+                    downtime if downtime is not None else frame,
+                    oee_frame=frame,
+                    production=frame,
+                    rates=finance_rates,
+                )
+                if isinstance(matrix, pd.DataFrame) and not matrix.empty:
+                    return inspect_this_week_narrative(matrix, finance_rates)
             maint = analyze_maintenance(
                 downtime if downtime is not None else frame,
                 production=frame,
                 oee_frame=frame,
             )
-            if any(w in q for w in ("inspect", "remaining risk", "this week")):
-                inspect = maint.get("inspect_this_week")
-                if isinstance(inspect, pd.DataFrame) and not inspect.empty:
-                    bits = [
-                        f"{r.get('machine_id')} (risk {float(r.get('remaining_risk', 0)):.0f}: {r.get('why')})"
-                        for _, r in inspect.head(3).iterrows()
-                    ]
-                    return "Inspect this week: " + "; ".join(bits) + "."
             if any(w in q for w in ("planned", "unplanned")):
                 pu = maint.get("planned_vs_unplanned") or {}
                 if pu.get("ok"):
@@ -527,7 +650,7 @@ def _offline_answer(
     return (
         "Here is a grounded plant briefing from current metrics:\n"
         f"{bullets}\n\n"
-        "Ask about OEE, downtime Pareto, MTTR/MTBF, inspect this week, scrap/FPY, or recommended actions."
+        "Ask about OEE, downtime Pareto, $ per lost hour, inspect this week ($ and PdM risk), scrap/FPY, or recommended actions."
     )
 
 
@@ -587,11 +710,12 @@ def ask_oee_question(
     history: Optional[list] = None,
     provider: str = "auto",
     quality: pd.DataFrame | None = None,
+    finance_rates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Answer plant-manager questions with Gemini/OpenAI or strong offline fallback."""
-    insight_list = insights or generate_insights(frame, downtime, quality)
-    offline = _offline_answer(question, frame, downtime, insight_list, quality)
-    context = build_metrics_context(frame, downtime, insight_list, quality)
+    insight_list = insights or generate_insights(frame, downtime, quality, finance_rates)
+    offline = _offline_answer(question, frame, downtime, insight_list, quality, finance_rates)
+    context = build_metrics_context(frame, downtime, insight_list, quality, finance_rates)
     status = llm_status()
 
     provider = (provider or "auto").lower().strip()

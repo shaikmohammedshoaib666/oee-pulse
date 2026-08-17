@@ -10,8 +10,15 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from modules.column_mapping import apply_mapping, load_mapping, save_mapping, suggest_mapping
 from modules.data_integration import plant_default_join
 from modules.downtime_analysis import downtime_pareto, mttr_mtbf
+from modules.finance_impact import (
+    asset_cost_risk_table,
+    default_finance_rates,
+    pareto_with_dollars,
+    plant_dollar_impact,
+)
 from modules.insights_engine import ask_oee_question, generate_insights
 from modules.maintenance_analysis import analyze_maintenance
 from modules.oee_engine import oee_summary
@@ -20,6 +27,7 @@ from modules.quality_analysis import analyze_quality
 from modules.quality_checks import build_quality_report, clean_plant_frame
 from modules.reports import build_html_brief, send_email_brief, write_html_report, write_pdf_report
 from modules.sample_data import generate_sample_plant
+from modules.sap_templates import TEMPLATE_MAPPINGS, production_template, templates_zip_bytes
 from modules import session_store
 
 
@@ -44,6 +52,24 @@ def main() -> None:
     data = generate_sample_plant(out_dir=sample_dir)
     prod, dt, qual = data["production"], data["downtime"], data["quality"]
     assert len(prod) > 50 and len(dt) > 50 and len(qual) > 50
+    for col in ("vibration_rms", "temp_c", "motor_current_a"):
+        assert col in prod.columns
+    assert "finance_rates" in data and float(data["finance_rates"]["plant_usd_per_hour"]) > 0
+
+    # SAP-style mapping: messy headers → canonical, then OEE
+    sap_prod = production_template()
+    suggested = suggest_mapping(list(sap_prod.columns))
+    assert suggested.get("line_id") == "ARBPL"
+    assert suggested.get("machine_id") == "EQUNR"
+    mapped_sap = apply_mapping(sap_prod, TEMPLATE_MAPPINGS["production"])
+    assert "line_id" in mapped_sap.columns and "machine_id" in mapped_sap.columns
+    sap_oee = oee_summary(mapped_sap)
+    assert 0 <= float(sap_oee["plant"]["oee"]) <= 1.5
+    zip_bytes = templates_zip_bytes()
+    assert len(zip_bytes) > 200
+    save_mapping("Smoke Plant", "production", TEMPLATE_MAPPINGS["production"], session_id="smoke")
+    loaded_map = load_mapping("Smoke Plant", "production")
+    assert loaded_map and loaded_map.get("line_id") == "ARBPL"
 
     integrated, logs = plant_default_join(prod, dt, qual)
     assert logs and len(integrated) > 0
@@ -64,8 +90,9 @@ def main() -> None:
     rel = mttr_mtbf(dt_clean)
     assert rel.get("ok")
 
-    insights = generate_insights(cleaned, dt_clean, qual)
+    insights = generate_insights(cleaned, dt_clean, qual, finance_rates=default_finance_rates())
     assert len(insights) >= 3
+    assert any("inspect this week" in (i.get("title") or "").lower() or "$" in (i.get("message") or "") for i in insights)
 
     qa = ask_oee_question(
         "Which line has the worst OEE and what drives downtime?",
@@ -93,6 +120,22 @@ def main() -> None:
     assert hours.get("ok") and hours.get("narrative")
     assert "Availability" in hours["narrative"] or "hours" in hours["narrative"].lower()
 
+    rates = default_finance_rates()
+    impact = plant_dollar_impact(cleaned, dt_clean, rates)
+    assert impact.get("ok")
+    assert float(impact.get("availability_hours") or 0) > 0
+    assert float(impact.get("availability_usd") or 0) > 0
+    assert "management estimate" in (impact.get("disclaimer") or "").lower()
+    dollar_pareto = pareto_with_dollars(dt_clean, rates)
+    assert dollar_pareto is not None and not dollar_pareto.empty
+    assert "usd_lost" in dollar_pareto.columns and float(dollar_pareto["usd_lost"].sum()) > 0
+    matrix, iso_meta = asset_cost_risk_table(dt_clean, oee_frame=cleaned, production=prod, rates=rates)
+    assert matrix is not None and not matrix.empty
+    for col in ("availability_hours_lost", "usd_lost", "remaining_risk"):
+        assert col in matrix.columns
+    assert float(matrix["usd_lost"].sum()) > 0
+    assert iso_meta.get("ok")  # sample has vibration/temp/current
+
     qan = analyze_quality(qual, oee_frame=cleaned, production=prod)
     assert qan.get("ok")
     kpis = qan.get("kpis") or {}
@@ -110,8 +153,11 @@ def main() -> None:
         quality=qual,
         insights=insights,
         provider="offline",
+        finance_rates=default_finance_rates(),
     )
     assert qa_m.get("ok") and "inspect" in qa_m.get("answer", "").lower()
+    ans_m = qa_m.get("answer", "").lower()
+    assert any(w in ans_m for w in ("risk", "$", "usd", "hour", "lost"))
     qa_q = ask_oee_question(
         "Which line is killing quality this week and what is the scrap rate?",
         cleaned,
@@ -131,23 +177,29 @@ def main() -> None:
         "Smoke Plant",
         plant,
         insights,
-        pareto.to_dict("records"),
+        dollar_pareto.to_dict("records"),
         rel,
         qa_answer=qa["answer"][:400],
         maintenance=maint,
         quality=qan,
+        finance=impact,
+        cost_risk_rows=matrix.head(5).to_dict("records"),
     )
     assert "Maintenance" in html and "Inspect this week" in html
     assert "Quality" in html and "FPY" in html
+    assert "Management estimate" in html or "Finance-aligned" in html
+    assert "$ lost" in html or "Lost OEE dollars" in html
     html_path = write_html_report(html, ROOT / "reports" / "output")
     pdf_path = write_pdf_report(
         {
             "plant_name": "Smoke Plant",
             "oee_plant": plant,
             "insights": insights,
-            "pareto_rows": pareto.to_dict("records"),
+            "pareto_rows": dollar_pareto.to_dict("records"),
             "maintenance": maint,
             "quality": qan,
+            "finance": impact,
+            "cost_risk_rows": matrix.head(5).to_dict("records"),
         },
         ROOT / "reports" / "output",
     )
@@ -192,6 +244,7 @@ def main() -> None:
     print(f"  OEE={float(plant['oee'])*100:.1f}% A={float(plant['availability'])*100:.1f}%")
     print(f"  insights={len(insights)} pareto_rows={len(pareto)} mttr={rel.get('mttr_min')}")
     print(f"  maint_inspect={len(inspect)} unplanned_pct={float(pu.get('unplanned_pct') or 0)*100:.0f}%")
+    print(f"  $avail={float(impact.get('availability_usd') or 0):.0f} cost_risk_rows={len(matrix)} iso={iso_meta.get('ok')}")
     print(f"  quality_fpy={float(kpis.get('fpy') or 0)*100:.1f}% cpk={qan.get('cpk', {}).get('cpk')}")
     print(f"  qa_source={qa.get('source')} forecast_ok={forecast.get('ok')}")
     print(f"  html={html_path.name} pdf={pdf_path.name} email={Path(email['path']).name}")

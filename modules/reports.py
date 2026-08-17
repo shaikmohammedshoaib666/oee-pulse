@@ -48,14 +48,17 @@ def build_html_brief(
     qa_answer: str = "",
     maintenance: Optional[dict[str, Any]] = None,
     quality: Optional[dict[str, Any]] = None,
+    finance: Optional[dict[str, Any]] = None,
+    cost_risk_rows: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     insight_html = "".join(
         f"<li><strong>[{i.get('priority','').upper()}]</strong> {i.get('message','')}</li>"
         for i in insights[:8]
     )
     pareto_html = "".join(
-        f"<tr><td>{r.get('cause')}</td><td>{r.get('downtime_minutes', 0):.0f}</td>"
-        f"<td>{float(r.get('pct', 0))*100:.1f}%</td></tr>"
+        f"<tr><td>{_esc(r.get('cause'))}</td><td>{float(r.get('downtime_minutes', 0)):.0f}</td>"
+        f"<td>{float(r.get('pct', 0))*100:.1f}%</td>"
+        f"<td>{('$' + format(float(r.get('usd_lost') or 0), ',.0f')) if r.get('usd_lost') is not None else '—'}</td></tr>"
         for r in pareto_rows[:8]
     )
     mttr = reliability.get("mttr_min", "—")
@@ -73,6 +76,40 @@ def build_html_brief(
   <div class="card">
     <h2>Manager Q&amp;A</h2>
     <p>{safe}</p>
+  </div>"""
+
+    finance_block = ""
+    if finance and finance.get("ok"):
+        finance_block = f"""
+  <div class="card">
+    <h2>Lost OEE dollars <span class="accent">({_esc(finance.get('label') or 'Management estimate')})</span></h2>
+    <table class="metrics">
+      <tr>
+        <td><strong>Availability hours</strong><br>{float(finance.get('availability_hours') or 0):.1f} h</td>
+        <td><strong>Availability $</strong><br>${float(finance.get('availability_usd') or 0):,.0f}</td>
+        <td><strong>Speed + quality $</strong><br>${float(finance.get('performance_usd') or 0) + float(finance.get('quality_usd') or 0):,.0f}</td>
+        <td><strong>Total $</strong><br>${float(finance.get('total_usd') or 0):,.0f}</td>
+      </tr>
+    </table>
+    <p>{_esc(finance.get('disclaimer') or '')}</p>
+  </div>"""
+
+    cost_html = "".join(
+        f"<tr><td>{_esc(r.get('machine_id'))}</td><td>{_esc(r.get('line_id'))}</td>"
+        f"<td>{float(r.get('availability_hours_lost') or 0):.1f}</td>"
+        f"<td>${float(r.get('usd_lost') or 0):,.0f}</td>"
+        f"<td>{float(r.get('remaining_risk') or 0):.0f}</td></tr>"
+        for r in (cost_risk_rows or [])[:8]
+    )
+    cost_block = ""
+    if cost_html:
+        cost_block = f"""
+  <div class="card">
+    <h2>Availability hours | $ lost | PdM risk</h2>
+    <table class="pareto">
+      <thead><tr><th>Asset</th><th>Line</th><th>Hours lost</th><th>$ lost</th><th>PdM risk</th></tr></thead>
+      <tbody>{cost_html}</tbody>
+    </table>
   </div>"""
 
     maint_block = ""
@@ -158,6 +195,8 @@ def build_html_brief(
     </table>
     <p>MTTR: {mttr} min · MTBF: {mtbf} min</p>
   </div>
+  {finance_block}
+  {cost_block}
   <div class="card">
     <h2>Manager Insights</h2>
     <ul>{insight_html or '<li>No insights generated.</li>'}</ul>
@@ -165,8 +204,8 @@ def build_html_brief(
   <div class="card">
     <h2>Downtime Pareto</h2>
     <table class="pareto">
-      <thead><tr><th>Cause</th><th>Minutes</th><th>%</th></tr></thead>
-      <tbody>{pareto_html or '<tr><td colspan="3">No downtime data</td></tr>'}</tbody>
+      <thead><tr><th>Cause</th><th>Minutes</th><th>%</th><th>$ lost</th></tr></thead>
+      <tbody>{pareto_html or '<tr><td colspan="4">No downtime data</td></tr>'}</tbody>
     </table>
   </div>
   {qa_block}
@@ -241,6 +280,25 @@ def write_pdf_report(html_summary: dict[str, Any], out_dir: Path | str = "report
         ("Quality", "quality"),
     ]:
         pdf.cell(0, 7, f"{label}: {float(oee.get(key, 0))*100:.1f}%", ln=True)
+    finance = html_summary.get("finance") or {}
+    if finance.get("ok"):
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.cell(0, 8, _pdf_safe(f"Lost OEE $ ({finance.get('label') or 'Management estimate'})"), ln=True)
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(
+            0,
+            7,
+            _pdf_safe(
+                f"Availability {float(finance.get('availability_hours') or 0):.1f} h  |  "
+                f"${float(finance.get('availability_usd') or 0):,.0f}  |  "
+                f"Total ${float(finance.get('total_usd') or 0):,.0f}"
+            ),
+            ln=True,
+        )
+        pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(0, 5, _pdf_safe(str(finance.get("disclaimer") or "")[:280]))
+        pdf.set_font("Helvetica", "", 12)
     pdf.ln(3)
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 8, "Insights", ln=True)
@@ -260,6 +318,11 @@ def write_pdf_report(html_summary: dict[str, Any], out_dir: Path | str = "report
             _pdf_safe(
                 f"{r.get('cause')}: {float(r.get('downtime_minutes', 0)):.0f} min "
                 f"({float(r.get('pct', 0))*100:.1f}%)"
+                + (
+                    f"  ${float(r.get('usd_lost')):,.0f}"
+                    if r.get("usd_lost") is not None
+                    else ""
+                )
             ),
             ln=True,
         )
@@ -283,6 +346,16 @@ def write_pdf_report(html_summary: dict[str, Any], out_dir: Path | str = "report
                 ),
                 ln=True,
             )
+    for r in _rows(html_summary.get("cost_risk_rows"), 6):
+        pdf.cell(
+            0,
+            6,
+            _pdf_safe(
+                f"{r.get('machine_id')}: {float(r.get('availability_hours_lost') or 0):.1f} h lost, "
+                f"${float(r.get('usd_lost') or 0):,.0f}, PdM risk {float(r.get('remaining_risk') or 0):.0f}"
+            ),
+            ln=True,
+        )
     qual = html_summary.get("quality") or {}
     if qual.get("ok"):
         pdf.ln(3)
