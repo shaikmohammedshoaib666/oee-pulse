@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+from modules.config_secrets import demo_email_mode, get_email_to, llm_status
 from modules.data_integration import (
     JOIN_TYPES,
     join_many,
@@ -20,13 +21,28 @@ from modules.data_integration import (
     try_duckdb_join,
 )
 from modules.downtime_analysis import downtime_pareto, mttr_mtbf, top_chronic_machines
-from modules.insights_engine import generate_insights
-from modules.oee_engine import aggregate_oee, oee_summary, prepare_oee_frame
+from modules.insights_engine import ask_oee_question, generate_insights
+from modules.oee_engine import oee_summary, prepare_oee_frame
 from modules.optuna_tuner import tune_and_forecast
 from modules.quality_checks import build_quality_report, clean_plant_frame
-from modules.reports import build_html_brief, send_email_brief, write_html_report, write_pdf_report
+from modules.reports import (
+    AUTOMATION_NOTE,
+    build_html_brief,
+    send_email_brief,
+    write_html_report,
+    write_pdf_report,
+)
 from modules.sample_data import generate_sample_plant
-from ui.session import init_session, reset_data
+from modules import session_store
+from ui.session import (
+    append_chat,
+    ensure_session_id,
+    get_active_frame,
+    init_session,
+    load_persisted_session,
+    persist_current_session,
+    reset_data,
+)
 from ui.theme import apply_theme, hero
 
 load_dotenv()
@@ -78,17 +94,17 @@ def load_sample_into_session() -> None:
     st.session_state.production_df = pd.read_csv(SAMPLE_DIR / "production_logs.csv")
     st.session_state.downtime_df = pd.read_csv(SAMPLE_DIR / "downtime_events.csv")
     st.session_state.quality_df = pd.read_csv(SAMPLE_DIR / "quality_rejects.csv")
-    for col in ("shift_date",):
+    for col in ("shift_date", "start_time", "end_time"):
         for key in ("production_df", "downtime_df", "quality_df"):
             df = st.session_state[key]
-            if col in df.columns:
+            if df is not None and col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
-    integrated, logs = plant_default_join(
+    _, logs = plant_default_join(
         st.session_state.production_df,
         st.session_state.downtime_df,
         st.session_state.quality_df,
     )
-    # Prefer shift-level production+quality with aggregated downtime
+    # Prefer shift-level production+quality (downtime minutes already on production sample)
     prod = st.session_state.production_df.merge(
         st.session_state.quality_df,
         on=["shift_date", "shift", "line_id", "machine_id"],
@@ -96,8 +112,55 @@ def load_sample_into_session() -> None:
         suffixes=("", "_q"),
     )
     st.session_state.integrated_df = prod
+    st.session_state.cleaned_df = None
+    st.session_state.oee_summary = None
+    st.session_state.insights = None
     st.session_state.join_logs = logs
     st.session_state.sample_loaded = True
+    ensure_session_id()
+    st.session_state.session_title = "Sample plant"
+    persist_current_session(title="Sample plant")
+
+
+def _render_chat_qa(frame: pd.DataFrame, key_prefix: str = "qa") -> None:
+    st.markdown("#### Ask the plant data")
+    st.caption(
+        "Manager Q&A grounded in OEE / downtime metrics. "
+        f"LLM: {llm_status()}"
+    )
+    hist = st.session_state.get("chat_history") or []
+    for msg in hist[-8:]:
+        role = msg.get("role", "user")
+        src = msg.get("source") or ""
+        label = "You" if role == "user" else f"OEE Pulse ({src or 'assistant'})"
+        st.markdown(f"**{label}:** {msg.get('content', '')}")
+
+    question = st.text_input(
+        "Question",
+        placeholder="e.g. Which line lost the most availability to changeovers?",
+        key=f"{key_prefix}_question",
+    )
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        ask = st.button("Ask", type="primary", key=f"{key_prefix}_ask", use_container_width=True)
+    with c2:
+        if st.button("Clear chat", key=f"{key_prefix}_clear"):
+            st.session_state.chat_history = []
+            persist_current_session()
+            st.rerun()
+
+    if ask and question.strip():
+        append_chat("user", question.strip())
+        result = ask_oee_question(
+            question.strip(),
+            frame,
+            downtime=st.session_state.downtime_df,
+            insights=st.session_state.insights,
+            history=st.session_state.chat_history,
+        )
+        append_chat("assistant", result.get("answer", ""), source=result.get("source", ""))
+        persist_current_session()
+        st.rerun()
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -109,11 +172,44 @@ with st.sidebar:
     if st.button("Load sample plant data", use_container_width=True):
         load_sample_into_session()
         st.success("Sample production, downtime & quality loaded.")
+    if st.button("Save session now", use_container_width=True):
+        sid = persist_current_session()
+        st.success(f"Saved {sid}")
     if st.button("Reset session", use_container_width=True):
         reset_data()
-        st.info("Session cleared.")
+        st.info("Session cleared (new empty session id).")
     st.divider()
-    st.caption("Demo email mode: " + os.getenv("OEE_PULSE_DEMO_MODE", "true"))
+    st.markdown("**Recent sessions**")
+    recent = session_store.list_sessions(12)
+    if not recent:
+        st.caption("No saved sessions yet.")
+    else:
+        labels = {
+            r["id"]: f"{r['title']} · {r['updated_at'][:16]}"
+            for r in recent
+        }
+        choice = st.selectbox(
+            "Reload",
+            options=list(labels.keys()),
+            format_func=lambda i: labels.get(i, i),
+            key="recent_session_pick",
+        )
+        if st.button("Load selected", use_container_width=True):
+            if load_persisted_session(choice):
+                st.success(f"Loaded {choice}")
+                st.rerun()
+            else:
+                st.error("Could not load session.")
+    st.divider()
+    email_default = st.session_state.get("email_to") or get_email_to()
+    st.session_state.email_to = st.text_input("Report email", value=email_default)
+    st.caption(
+        "Demo email: "
+        + ("on (disk save)" if demo_email_mode() else "off (SMTP)")
+    )
+    cur = st.session_state.get("session_id")
+    if cur:
+        st.caption(f"Session: {st.session_state.get('session_title') or cur}")
 
 
 hero()
@@ -151,6 +247,7 @@ if page == "Upload & Integrate":
     with tabs[1]:
         if st.session_state.downtime_df is not None:
             st.dataframe(st.session_state.downtime_df.head(100), use_container_width=True)
+            st.caption(f"{len(st.session_state.downtime_df)} rows")
         else:
             st.info("No downtime data yet.")
     with tabs[2]:
@@ -169,7 +266,8 @@ if page == "Upload & Integrate":
             how = st.selectbox("Join type", list(JOIN_TYPES.keys()), index=1)
             st.caption(JOIN_TYPES[how])
             keys = suggest_join_keys(st.session_state.production_df, st.session_state.downtime_df)
-            on = st.multiselect("Join keys", keys, default=keys[: min(3, len(keys))] or keys)
+            default_keys = keys[: min(3, len(keys))] if keys else []
+            on = st.multiselect("Join keys", keys, default=default_keys)
             engine = st.radio("Engine", ["pandas", "duckdb (optional)"], horizontal=True)
             if st.button("Run 3-table integration", type="primary"):
                 if engine.startswith("duckdb"):
@@ -184,30 +282,38 @@ if page == "Upload & Integrate":
                     else:
                         st.warning("DuckDB join failed — falling back to pandas.")
                         engine = "pandas"
-                if not engine.startswith("duckdb") or st.session_state.integrated_df is None:
+                if (not engine.startswith("duckdb")) or (st.session_state.integrated_df is None):
                     steps = [
                         {
                             "left": "production",
                             "right": "downtime",
                             "how": how,
-                            "on": on or None,
+                            "on": on if on else None,
                         },
                         {
                             "left": "_result",
                             "right": "quality",
                             "how": how,
-                            "on": on or None,
+                            "on": on if on else None,
                         },
                     ]
-                    # Shift-level product for OEE: production ⋈ quality, keep event downtime separate
+                    join_on = on if on else suggest_join_keys(
+                        st.session_state.production_df, st.session_state.quality_df
+                    )[:3]
                     prod_q = st.session_state.production_df.merge(
                         st.session_state.quality_df,
-                        on=on if on else suggest_join_keys(
-                            st.session_state.production_df, st.session_state.quality_df
-                        )[:3],
+                        on=join_on,
                         how="left",
                         suffixes=("", "_q"),
                     )
+                    dt = st.session_state.downtime_df
+                    minutes_col = "downtime_minutes" if "downtime_minutes" in dt.columns else None
+                    if minutes_col and all(c in dt.columns for c in join_on):
+                        agg = dt.groupby(list(join_on), as_index=False)[minutes_col].sum()
+                        if "downtime_minutes" in prod_q.columns:
+                            prod_q = prod_q.drop(columns=["downtime_minutes"])
+                        prod_q = prod_q.merge(agg, on=join_on, how="left")
+                        prod_q["downtime_minutes"] = prod_q["downtime_minutes"].fillna(0)
                     st.session_state.integrated_df = prod_q
                     _, logs = join_many(
                         {
@@ -218,8 +324,10 @@ if page == "Upload & Integrate":
                         steps,
                     )
                     st.session_state.join_logs = logs
+                st.session_state.cleaned_df = None
+                persist_current_session(title=st.session_state.get("session_title") or "Integrated data")
                 st.success(f"Integrated frame: {st.session_state.integrated_df.shape}")
-            if st.session_state.join_logs:
+            if st.session_state.join_logs is not None:
                 st.json(st.session_state.join_logs)
             if st.session_state.integrated_df is not None:
                 st.dataframe(st.session_state.integrated_df.head(50), use_container_width=True)
@@ -236,7 +344,6 @@ elif page == "Clean & Quality":
     else:
         if st.button("Run industrial clean + quality checks", type="primary"):
             cleaned, clog = clean_plant_frame(src)
-            # Also clean downtime / quality tables if present
             if st.session_state.downtime_df is not None:
                 st.session_state.downtime_df, _ = clean_plant_frame(st.session_state.downtime_df)
             if st.session_state.quality_df is not None:
@@ -244,11 +351,15 @@ elif page == "Clean & Quality":
             st.session_state.cleaned_df = cleaned
             st.session_state.quality_report = build_quality_report(cleaned)
             st.session_state.clean_log = clog
+            st.session_state.oee_summary = None
+            persist_current_session(title=st.session_state.get("session_title") or "Cleaned data")
 
         if st.session_state.cleaned_df is not None:
             st.write("**Cleaning log**")
-            st.json(getattr(st.session_state, "clean_log", {}))
-            report = st.session_state.quality_report or {}
+            st.json(st.session_state.get("clean_log") or {})
+            report = st.session_state.quality_report
+            if report is None:
+                report = {}
             summary = report.get("summary", {})
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Checks", summary.get("total", 0))
@@ -266,9 +377,7 @@ elif page == "Clean & Quality":
 # ── OEE Cockpit ───────────────────────────────────────────────────────────────
 elif page == "OEE Cockpit":
     st.subheader("OEE Cockpit")
-    frame = st.session_state.cleaned_df
-    if frame is None:
-        frame = st.session_state.integrated_df
+    frame = get_active_frame()
     if frame is None:
         st.warning("Integrate (and optionally clean) data first — or load sample plant data.")
     else:
@@ -283,7 +392,6 @@ elif page == "OEE Cockpit":
         e.metric("Gap to 85%", f"{summary['world_class_gap']*100:.1f} pts")
 
         work = summary["frame"]
-        # Waterfall-style loss stacked bar
         loss_df = pd.DataFrame(
             {
                 "component": ["Availability loss", "Performance loss", "Quality loss", "OEE realized"],
@@ -362,36 +470,54 @@ elif page == "Downtime Analysis":
     st.subheader("Downtime Analysis")
     dt = st.session_state.downtime_df
     if dt is None:
-        st.warning("Load downtime events (or sample data).")
-    else:
+        alt = get_active_frame()
+        if alt is not None and any(
+            c in alt.columns for c in ("downtime_code", "downtime_category", "downtime_minutes")
+        ):
+            dt = alt
+            st.info("Using active production frame for downtime metrics (no separate events table).")
+        else:
+            st.warning("Load downtime events (or sample data).")
+            dt = None
+
+    if dt is not None:
         try:
             pareto = downtime_pareto(dt)
-            fig = go.Figure()
-            fig.add_trace(
-                go.Bar(
-                    x=pareto["cause"],
-                    y=pareto["downtime_minutes"],
-                    name="Minutes",
-                    marker_color="#64748b",
+            if pareto.empty:
+                st.warning("No downtime minutes to chart.")
+            else:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        x=pareto["cause"],
+                        y=pareto["downtime_minutes"],
+                        name="Minutes",
+                        marker_color="#64748b",
+                    )
                 )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=pareto["cause"],
-                    y=pareto["cum_pct"],
-                    name="Cumulative %",
-                    yaxis="y2",
-                    mode="lines+markers",
-                    line=dict(color="#f59e0b", width=3),
+                fig.add_trace(
+                    go.Scatter(
+                        x=pareto["cause"],
+                        y=pareto["cum_pct"],
+                        name="Cumulative %",
+                        yaxis="y2",
+                        mode="lines+markers",
+                        line=dict(color="#f59e0b", width=3),
+                    )
                 )
-            )
-            fig.update_layout(
-                title="Downtime Pareto",
-                yaxis=dict(title="Minutes"),
-                yaxis2=dict(title="Cumulative %", overlaying="y", side="right", tickformat=".0%", range=[0, 1.05]),
-            )
-            st.plotly_chart(_style_fig(fig), use_container_width=True)
-            st.dataframe(pareto, use_container_width=True)
+                fig.update_layout(
+                    title="Downtime Pareto",
+                    yaxis=dict(title="Minutes"),
+                    yaxis2=dict(
+                        title="Cumulative %",
+                        overlaying="y",
+                        side="right",
+                        tickformat=".0%",
+                        range=[0, 1.05],
+                    ),
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+                st.dataframe(pareto, use_container_width=True)
         except Exception as exc:
             st.error(f"Pareto failed: {exc}")
 
@@ -406,7 +532,7 @@ elif page == "Downtime Analysis":
             st.info(rel.get("reason", "Reliability metrics unavailable"))
 
         chronic = top_chronic_machines(dt)
-        if not chronic.empty:
+        if chronic is not None and not chronic.empty:
             st.write("**Chronic downtime machines**")
             fig = px.bar(
                 chronic,
@@ -419,7 +545,7 @@ elif page == "Downtime Analysis":
             st.plotly_chart(_style_fig(fig), use_container_width=True)
             st.dataframe(chronic, use_container_width=True)
 
-        if "line_id" in dt.columns:
+        if "line_id" in dt.columns and "downtime_minutes" in dt.columns:
             by_line = dt.groupby("line_id")["downtime_minutes"].sum().reset_index()
             fig = px.pie(
                 by_line,
@@ -434,7 +560,7 @@ elif page == "Downtime Analysis":
 # ── Insights ──────────────────────────────────────────────────────────────────
 elif page == "Insights":
     st.subheader("Insights")
-    frame = st.session_state.cleaned_df or st.session_state.integrated_df
+    frame = get_active_frame()
     if frame is None:
         st.warning("Need integrated production data.")
     else:
@@ -443,15 +569,21 @@ elif page == "Insights":
         if st.button("Generate manager insights", type="primary"):
             insights = generate_insights(frame, st.session_state.downtime_df)
             st.session_state.insights = insights
-            st.session_state.forecast = tune_and_forecast(frame, n_trials=n_trials, use_optuna=use_optuna)
+            st.session_state.forecast = tune_and_forecast(
+                frame, n_trials=n_trials, use_optuna=use_optuna
+            )
+            persist_current_session()
 
-        if st.session_state.insights:
-            for item in st.session_state.insights:
+        insights = st.session_state.get("insights")
+        if insights:
+            for item in insights:
                 pr = item.get("priority", "medium")
                 st.markdown(
                     f'<div class="priority-{pr}"><strong>{item.get("title")}</strong><br>{item.get("message")}</div>',
                     unsafe_allow_html=True,
                 )
+        else:
+            st.info("Generate insights (or ask a question below — offline answers work immediately).")
 
         forecast = st.session_state.get("forecast")
         if forecast:
@@ -486,16 +618,27 @@ elif page == "Insights":
             else:
                 st.info(forecast.get("reason", "Forecast unavailable"))
 
+        st.divider()
+        _render_chat_qa(frame, key_prefix="insights")
+
 
 # ── Reports ───────────────────────────────────────────────────────────────────
 elif page == "Reports":
     st.subheader("Reports & Email Brief")
-    frame = st.session_state.cleaned_df or st.session_state.integrated_df
+    frame = get_active_frame()
     if frame is None:
         st.warning("Need data before reporting.")
     else:
-        summary = st.session_state.oee_summary or oee_summary(frame)
-        insights = st.session_state.insights or generate_insights(frame, st.session_state.downtime_df)
+        summary = st.session_state.get("oee_summary")
+        if summary is None:
+            summary = oee_summary(frame)
+            st.session_state.oee_summary = summary
+
+        insights = st.session_state.get("insights")
+        if not insights:
+            insights = generate_insights(frame, st.session_state.downtime_df)
+            st.session_state.insights = insights
+
         plant_name = os.getenv("PLANT_NAME", "North Plant")
         pareto_rows = []
         reliability = {}
@@ -506,19 +649,37 @@ elif page == "Reports":
                 pareto_rows = []
             reliability = mttr_mtbf(st.session_state.downtime_df)
 
+        last_assistant = ""
+        for msg in reversed(st.session_state.get("chat_history") or []):
+            if msg.get("role") == "assistant":
+                last_assistant = msg.get("content", "")
+                break
+
         html = build_html_brief(
             plant_name=plant_name,
             oee_plant=summary["plant"],
             insights=insights,
             pareto_rows=pareto_rows,
             reliability=reliability,
+            qa_answer=last_assistant[:1200],
         )
+        st.session_state.last_report_html = html
         st.components.v1.html(html, height=520, scrolling=True)
+
+        st.divider()
+        _render_chat_qa(frame, key_prefix="reports")
+
+        st.divider()
+        st.markdown("#### Export & email")
+        to_addr = st.session_state.get("email_to") or get_email_to()
+        to_addr = st.text_input("Send to", value=to_addr, key="report_email_to")
+        st.session_state.email_to = to_addr
 
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("Export HTML", use_container_width=True):
                 path = write_html_report(html, ROOT / "reports" / "output")
+                persist_current_session()
                 st.success(f"Wrote {path}")
                 st.download_button("Download HTML", data=html, file_name=path.name, mime="text/html")
         with c2:
@@ -532,6 +693,7 @@ elif page == "Reports":
                     },
                     ROOT / "reports" / "output",
                 )
+                persist_current_session()
                 st.success(f"Wrote {path}")
                 st.download_button(
                     "Download PDF",
@@ -540,10 +702,23 @@ elif page == "Reports":
                     mime="application/pdf",
                 )
         with c3:
-            if st.button("Send email brief", use_container_width=True, type="primary"):
-                result = send_email_brief(html)
+            if st.button("Email report now", use_container_width=True, type="primary"):
+                result = send_email_brief(html, to_addr=to_addr)
+                persist_current_session()
                 if result.get("ok"):
                     st.success(result.get("message") or f"Sent to {result.get('to')}")
                 else:
-                    st.error(result.get("error", "Send failed"))
+                    st.error(result.get("error") or result.get("message") or "Send failed")
                 st.json(result)
+
+        with st.expander("Automation note (schedule / inbound email)"):
+            st.markdown(AUTOMATION_NOTE)
+            st.text_area(
+                "Optional schedule reminder (saved with session)",
+                value=st.session_state.get("schedule_note") or "Daily 06:00 — Email report now / external cron",
+                key="schedule_note_input",
+            )
+            if st.button("Save schedule note"):
+                st.session_state.schedule_note = st.session_state.get("schedule_note_input", "")
+                persist_current_session()
+                st.success("Saved.")

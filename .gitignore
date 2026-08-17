@@ -27,6 +27,7 @@ build/
 .streamlit/secrets.toml
 reports/output/
 data/uploads/
+data/sessions/
 *.log
 .coverage
 htmlcov/

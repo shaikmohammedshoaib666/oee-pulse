@@ -120,8 +120,10 @@ def top_chronic_machines(df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
     minutes = find_col(df, "downtime_minutes", "downtime_min")
     if not machine or not minutes:
         return pd.DataFrame()
+    work = df.copy()
+    work[minutes] = pd.to_numeric(work[minutes], errors="coerce").fillna(0)
     g = (
-        df.groupby(machine)[minutes]
+        work.groupby(machine)[minutes]
         .agg(events="count", downtime_minutes="sum", mean_min="mean")
         .reset_index()
         .sort_values("downtime_minutes", ascending=False)

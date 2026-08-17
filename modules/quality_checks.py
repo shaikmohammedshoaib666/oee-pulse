@@ -252,7 +252,12 @@ def clean_plant_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
             )
         ):
             out[c] = pd.to_numeric(out[c], errors="coerce")
-        if any(k in cl for k in ("timestamp", "date", "time")):
+        # Avoid treating downtime_minutes / planned_time_min as datetimes
+        if any(k in cl for k in ("minute", "min", "count", "rate", "oee")):
+            continue
+        if any(k in cl for k in ("timestamp", "shift_date", "start_time", "end_time", "datetime")) or (
+            cl.endswith("_date") or cl.endswith("_time") or cl in {"date", "time"}
+        ):
             out[c] = pd.to_datetime(out[c], errors="coerce")
     dups = int(out.duplicated().sum())
     out = out.drop_duplicates()

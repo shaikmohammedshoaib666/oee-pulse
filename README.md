@@ -2,7 +2,7 @@
 
 **Industry 4.0 analytics SaaS** for plant managers and industrial engineers — focused on **OEE**, **unplanned downtime**, and actionable production insights.
 
-Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto downtime → manager-language insights → HTML/PDF/email brief.
+Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto downtime → manager-language insights + Q&A → HTML/PDF/email brief. Sessions persist across browser reloads.
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-slate)
 ![Streamlit](https://img.shields.io/badge/streamlit-SaaS%20MVP-amber)
@@ -19,11 +19,12 @@ Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto dow
 | Module | What it does |
 |--------|----------------|
 | **Upload & Integrate** | Multi-file upload (production, downtime, quality) + SQL-style 3-table joins (pandas / optional DuckDB) |
-| **Clean & Quality** | Industrial cleaning + statistical / ML quality checks (z-score, IQR, Isolation Forest, DBSCAN, PCA drift, OEE domain rules) |
-| **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns, loss decomposition |
+| **Clean & Quality** | Industrial cleaning + statistical / ML quality checks |
+| **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns |
 | **Downtime Analysis** | Pareto of downtime codes, MTTR / MTBF lite, chronic machines |
-| **Insights** | Manager language (“Line 3 lost X% availability to changeovers”) + optional Optuna-tuned scrap/downtime forecast |
-| **Reports** | HTML + PDF export, email brief (demo mode by default) |
+| **Insights** | Manager language + Optuna forecast + LLM/offline Q&A (Gemini/OpenAI) |
+| **Reports** | HTML + PDF export, email brief (SMTP or demo disk save), automation notes |
+| **Persistence** | SQLite + CSV session store — recent sessions in sidebar, reload last session |
 
 ## Quick start (local)
 
@@ -36,52 +37,81 @@ python -m modules.sample_data   # writes sample_data/*.csv
 streamlit run app.py
 ```
 
-Open the URL Streamlit prints (usually http://localhost:8501), then click **Load sample plant data** in the sidebar.
+Open the URL Streamlit prints, then click **Load sample plant data** in the sidebar.
+
+Smoke test:
+
+```bash
+python scripts/smoke_test.py
+```
 
 ## Streamlit Community Cloud
 
-1. Push this repo to GitHub (already set up if you cloned from the public repo).
+1. Push this repo to GitHub.
 2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
 3. Select the repo, branch `main`, main file `app.py`.
-4. Deploy. Optional: add secrets from `.env.example` in the Cloud secrets UI.
+4. Add secrets (see below) in **Settings → Secrets**.
+5. Redeploy after pushes to `main`.
 
-## Configuration
+## Secrets / `.env`
 
-Copy `.env.example` → `.env`:
+Copy `.env.example` → `.env`, or paste into Streamlit Cloud secrets:
 
-```bash
-cp .env.example .env
+```toml
+OEE_PULSE_DEMO_MODE = "true"
+EMAIL_TO = "you@company.com"
+PLANT_NAME = "North Plant"
+
+# Real email (set DEMO false + SMTP)
+# OEE_PULSE_DEMO_MODE = "false"
+# SMTP_HOST = "smtp.gmail.com"
+# SMTP_PORT = "587"
+# SMTP_USER = "you@gmail.com"
+# SMTP_PASSWORD = "app-password"
+# SMTP_FROM = "you@gmail.com"
+# SMTP_TO = "plant.manager@company.com"
+
+# Optional LLM for Insights / Reports Q&A
+# GEMINI_API_KEY = "..."
+# GEMINI_MODEL = "gemini-2.0-flash"
+# OPENAI_API_KEY = "sk-..."
+# OPENAI_MODEL = "gpt-4o-mini"
+# AI_DEFAULT_PROVIDER = "gemini"
 ```
 
 | Variable | Purpose |
 |----------|---------|
-| `OEE_PULSE_DEMO_MODE` | `true` = simulate email (default) |
+| `OEE_PULSE_DEMO_MODE` | `true` = save email HTML under `reports/output/email_demo/` |
+| `EMAIL_TO` / `SMTP_TO` | Default report recipient |
 | `SMTP_*` | Real SMTP when demo mode is off |
-| `PLANT_NAME` | Shown in sidebar / reports |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | LLM Q&A (offline fallback always works) |
+| `PLANT_NAME` | Sidebar / reports |
 
 ## Architecture
 
 ```
 app.py                 Streamlit SaaS shell (sidebar nav + pages)
-ui/                    Theme (slate/steel/amber) + session state
+ui/                    Theme + session helpers (get_active_frame, persist)
 modules/
+  config_secrets.py    Env + Streamlit secrets
+  session_store.py     SQLite metadata + CSV frames under data/sessions/
   data_integration.py  Multi-file load + chained joins
   quality_checks.py    Industrial clean + quality report
   oee_engine.py        OEE math + aggregations
   downtime_analysis.py Pareto, MTTR/MTBF
-  insights_engine.py   Manager-language insights
+  insights_engine.py   Manager insights + ask_oee_question (LLM/offline)
   optuna_tuner.py      Optional forecast / anomaly tuning
   reports.py           HTML / PDF / email brief
   sample_data.py       Synthetic multi-line plant CSVs
-sample_data/           Generated demo CSVs
-reports/output/        Exported briefs
 ```
 
-**Data flow:** Production + Downtime + Quality → join → clean/QC → OEE engine → Pareto & reliability → insights / Optuna → report.
+**Data flow:** Production + Downtime + Quality → join → clean/QC → OEE → Pareto → insights / Q&A → report / email.
 
-## Tech stack
+## Email automation MVP
 
-Python 3.9+ · Streamlit · pandas · numpy · scikit-learn · Plotly · Optuna · DuckDB (optional) · fpdf2
+- **Email report now** sends (or demo-saves) the latest brief to `EMAIL_TO`.
+- Streamlit Cloud does not run long-lived schedulers; use external cron / GitHub Actions later, or click daily.
+- Inbound email → auto-report is a **future connector** (documented in-app).
 
 ## License
 
