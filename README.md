@@ -75,7 +75,7 @@ PLANT_NAME = "North Plant"
 
 # Optional LLM for Insights / Reports Q&A
 # GEMINI_API_KEY = "..."
-# GEMINI_MODEL = "gemini-2.0-flash"
+# GEMINI_MODEL = "gemini-3.6-flash"
 # OPENAI_API_KEY = "sk-..."
 # OPENAI_MODEL = "gpt-4o-mini"
 # AI_DEFAULT_PROVIDER = "gemini"

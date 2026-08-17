@@ -86,8 +86,24 @@ def get_openai_api_key() -> str:
     return secret("OPENAI_API_KEY", "")
 
 
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+RETIRED_GEMINI_ALIASES = frozenset(
+    {
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+        "gemini-flash-latest-latest",
+        "gemini-1.5-flash",
+        "gemini-pro",
+    }
+)
+
+
 def get_gemini_model() -> str:
-    return secret("GEMINI_MODEL", "gemini-2.0-flash") or "gemini-2.0-flash"
+    raw = secret("GEMINI_MODEL", DEFAULT_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL
+    name = raw[7:] if str(raw).lower().startswith("models/") else str(raw).strip()
+    if not name or name.lower() in RETIRED_GEMINI_ALIASES:
+        return DEFAULT_GEMINI_MODEL
+    return name
 
 
 def get_openai_model() -> str:
