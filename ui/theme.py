@@ -92,7 +92,7 @@ def hero(subtitle: str = "Industry 4.0 OEE & downtime analytics for plant manage
     st.markdown(
         f"""
         <div class="op-hero">
-          <div><span class="op-pill">OEE</span><span class="op-pill">DOWNTIME</span><span class="op-pill">SAAS MVP</span></div>
+          <div><span class="op-pill">OEE</span><span class="op-pill">DOWNTIME</span><span class="op-pill">MAINT</span><span class="op-pill">QUALITY</span></div>
           <div class="brand">OEE <span>Pulse</span></div>
           <div class="tag">{subtitle}</div>
         </div>

@@ -22,8 +22,10 @@ from modules.data_integration import (
 )
 from modules.downtime_analysis import downtime_pareto, mttr_mtbf, top_chronic_machines
 from modules.insights_engine import ask_oee_question, generate_insights
+from modules.maintenance_analysis import analyze_maintenance, frame_ok as maint_frame_ok
 from modules.oee_engine import oee_summary, prepare_oee_frame
 from modules.optuna_tuner import tune_and_forecast
+from modules.quality_analysis import analyze_quality, frame_ok as quality_frame_ok
 from modules.quality_checks import build_quality_report, clean_plant_frame
 from modules.reports import (
     AUTOMATION_NOTE,
@@ -64,6 +66,8 @@ NAV = [
     "Clean & Quality",
     "OEE Cockpit",
     "Downtime Analysis",
+    "Maintenance",
+    "Quality",
     "Insights",
     "Reports",
 ]
@@ -155,12 +159,29 @@ def _render_chat_qa(frame: pd.DataFrame, key_prefix: str = "qa") -> None:
             question.strip(),
             frame,
             downtime=st.session_state.downtime_df,
+            quality=st.session_state.quality_df,
             insights=st.session_state.insights,
             history=st.session_state.chat_history,
         )
         append_chat("assistant", result.get("answer", ""), source=result.get("source", ""))
         persist_current_session()
         st.rerun()
+
+
+def _render_cards(cards: list) -> None:
+    for item in cards or []:
+        pr = item.get("priority", "medium")
+        st.markdown(
+            f'<div class="priority-{pr}"><strong>{item.get("title")}</strong><br>{item.get("message")}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _store_dept_analyses(maint=None, qual=None) -> None:
+    if maint is not None:
+        st.session_state.maintenance_analysis = maint
+    if qual is not None:
+        st.session_state.quality_analysis = qual
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -557,6 +578,259 @@ elif page == "Downtime Analysis":
             st.plotly_chart(_style_fig(fig), use_container_width=True)
 
 
+# ── Maintenance ───────────────────────────────────────────────────────────────
+elif page == "Maintenance":
+    st.subheader("Maintenance")
+    st.caption(
+        "Reliability overlay on the same plant data — asset risk, planned vs unplanned, "
+        "and inspect-this-week ranking tied to OEE Availability hours lost."
+    )
+    dt = st.session_state.downtime_df
+    if not maint_frame_ok(dt):
+        st.warning("Downtime events table missing. Upload events or click **Load sample plant data**.")
+        alt = get_active_frame()
+        if maint_frame_ok(alt) and any(
+            c in alt.columns for c in ("downtime_minutes", "downtime_code", "downtime_category")
+        ):
+            dt = alt
+            st.info("Using the active production frame as a downtime overlay.")
+        else:
+            dt = None
+
+    if maint_frame_ok(dt):
+        maint = analyze_maintenance(
+            dt,
+            production=st.session_state.production_df,
+            oee_frame=get_active_frame(),
+        )
+        _store_dept_analyses(maint=maint)
+
+        if not maint.get("ok"):
+            st.warning(maint.get("reason", "Maintenance analysis unavailable."))
+        else:
+            rel = maint.get("reliability") or {}
+            hours = maint.get("hours_lost") or {}
+            pu = maint.get("planned_vs_unplanned") or {}
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Events", rel.get("events", "—"))
+            c2.metric("MTTR (min)", rel.get("mttr_min", "—"))
+            c3.metric("MTBF (min)", rel.get("mtbf_min", "—"))
+            c4.metric("Hours lost", f"{float(hours.get('downtime_hours') or 0):.1f}")
+            c5.metric("Unplanned", f"{float(pu.get('unplanned_pct') or 0)*100:.0f}%")
+            if hours.get("narrative"):
+                st.info(hours["narrative"])
+            _render_cards(maint.get("cards") or [])
+
+            inspect = maint.get("inspect_this_week")
+            if isinstance(inspect, pd.DataFrame) and not inspect.empty:
+                st.write("**Inspect this week**")
+                fig = px.bar(
+                    inspect.sort_values("remaining_risk"),
+                    x="remaining_risk",
+                    y="machine_id",
+                    color="line_id",
+                    orientation="h",
+                    title="Remaining-risk ranking (rule-based + optional sensor IsolationForest)",
+                    color_discrete_sequence=["#64748b", "#94a3b8", "#f59e0b"],
+                    hover_data=["mttr_min", "failure_freq_per_day", "unplanned_share", "why"],
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+                iso = maint.get("iso") or {}
+                if iso.get("ok"):
+                    st.caption(
+                        f"IsolationForest on sensors {iso.get('features')} · "
+                        f"{iso.get('anomaly_count')} anomalous rows / {iso.get('rows')}"
+                    )
+                else:
+                    st.caption(f"Sensor IsolationForest skipped: {iso.get('reason', 'no numeric sensors')}")
+                st.dataframe(inspect, use_container_width=True)
+
+            assets = maint.get("asset_risk")
+            if isinstance(assets, pd.DataFrame) and not assets.empty:
+                st.write("**Asset / line risk (MTTR, MTBF, frequency, longest event)**")
+                st.dataframe(assets, use_container_width=True)
+
+            scope = st.radio("Reason Pareto scope", ["machine_id", "line_id"], horizontal=True)
+            rpareto = maint.get("reason_by_machine") if scope == "machine_id" else maint.get("reason_by_line")
+            if isinstance(rpareto, pd.DataFrame) and not rpareto.empty:
+                fig = px.bar(
+                    rpareto,
+                    x="cause",
+                    y="downtime_minutes",
+                    color="asset",
+                    barmode="group",
+                    title=f"Downtime reasons by {scope.replace('_id', '')}",
+                    color_discrete_sequence=["#334155", "#64748b", "#94a3b8", "#f59e0b", "#e2e8f0"],
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+
+            by_line = pu.get("by_line")
+            if isinstance(by_line, pd.DataFrame) and not by_line.empty:
+                fig = px.bar(
+                    by_line,
+                    x="line_id",
+                    y="downtime_minutes",
+                    color="event_class",
+                    barmode="stack",
+                    title=f"Planned vs unplanned by line ({pu.get('source', 'heuristic')})",
+                    color_discrete_map={"Planned": "#94a3b8", "Unplanned": "#f59e0b"},
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+
+            longest = maint.get("longest_events")
+            if isinstance(longest, pd.DataFrame) and not longest.empty:
+                st.write("**Longest downtime events**")
+                st.dataframe(longest, use_container_width=True)
+
+            frame = get_active_frame()
+            if frame is not None:
+                st.divider()
+                _render_chat_qa(frame, key_prefix="maint")
+
+
+# ── Quality ───────────────────────────────────────────────────────────────────
+elif page == "Quality":
+    st.subheader("Quality")
+    st.caption(
+        "SPC / scrap / defects overlay on the same plant data — FPY, defect Pareto, "
+        "and contribution to the Quality component of OEE."
+    )
+    qdf = st.session_state.quality_df
+    if not quality_frame_ok(qdf):
+        st.warning("Quality / rejects table missing. Upload rejects or click **Load sample plant data**.")
+        alt = get_active_frame()
+        if quality_frame_ok(alt) and any(
+            c in alt.columns for c in ("scrap_rate", "reject_count", "good_count", "defect_code")
+        ):
+            qdf = alt
+            st.info("Using the active production frame as a quality overlay.")
+        else:
+            qdf = None
+
+    if quality_frame_ok(qdf):
+        qan = analyze_quality(qdf, oee_frame=get_active_frame(), production=st.session_state.production_df)
+        _store_dept_analyses(qual=qan)
+
+        if not qan.get("ok"):
+            st.warning(qan.get("reason", "Quality analysis unavailable."))
+        else:
+            k = qan.get("kpis") or {}
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Scrap", f"{float(k.get('scrap_rate') or 0)*100:.1f}%")
+            m2.metric("First-pass yield", f"{float(k.get('fpy') or 0)*100:.1f}%")
+            m3.metric("Quality OEE", f"{float(k.get('quality_oee') or 0)*100:.1f}%")
+            m4.metric("Rejects", f"{float(k.get('rejects') or 0):,.0f}")
+            loss = k.get("quality_loss_oee_pts")
+            m5.metric("Q-loss (OEE pts)", "—" if loss is None else f"{float(loss)*100:.1f}")
+            if qan.get("defect_synthesized"):
+                st.caption("Defect codes were synthesized — upload defect_code/type for a true Pareto.")
+            _render_cards(qan.get("cards") or [])
+
+            by_line = k.get("by_line")
+            if isinstance(by_line, pd.DataFrame) and not by_line.empty:
+                fig = px.bar(
+                    by_line,
+                    x="line_id",
+                    y=["scrap_rate_weighted", "fpy_weighted"],
+                    barmode="group",
+                    title="Scrap vs first-pass yield by line",
+                    color_discrete_sequence=["#f59e0b", "#94a3b8"],
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+
+            pareto = qan.get("defect_pareto")
+            if isinstance(pareto, pd.DataFrame) and not pareto.empty:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        x=pareto["defect_code"],
+                        y=pareto["rejects"],
+                        name="Rejects",
+                        marker_color="#64748b",
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=pareto["defect_code"],
+                        y=pareto["cum_pct"],
+                        name="Cumulative %",
+                        yaxis="y2",
+                        mode="lines+markers",
+                        line=dict(color="#f59e0b", width=3),
+                    )
+                )
+                fig.update_layout(
+                    title="Defect Pareto",
+                    yaxis=dict(title="Rejects"),
+                    yaxis2=dict(
+                        title="Cumulative %",
+                        overlaying="y",
+                        side="right",
+                        tickformat=".0%",
+                        range=[0, 1.05],
+                    ),
+                )
+                st.plotly_chart(_style_fig(fig), use_container_width=True)
+                st.dataframe(pareto, use_container_width=True)
+
+            spc = qan.get("spc") or {}
+            if spc.get("ok"):
+                st.write(f"**SPC lite** — {spc.get('method')} on `{spc.get('metric')}`")
+                plant = spc.get("plant") or {}
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("CL", plant.get("cl", "—"))
+                s2.metric("UCL", plant.get("ucl", "—"))
+                s3.metric("LCL", plant.get("lcl", "—"))
+                s4.metric("Out of control", plant.get("ooc_count", 0))
+                chart = spc.get("chart_df")
+                if isinstance(chart, pd.DataFrame) and not chart.empty:
+                    xcol = "shift_date" if "shift_date" in chart.columns else "point"
+                    fig = px.line(
+                        chart,
+                        x=xcol,
+                        y="xbar",
+                        color="line_id" if "line_id" in chart.columns else None,
+                        markers=True,
+                        title=f"X-bar / MR — {spc.get('metric')} by shift/line",
+                        color_discrete_sequence=["#94a3b8", "#f59e0b", "#e2e8f0"],
+                    )
+                    if plant.get("ucl") is not None:
+                        fig.add_hline(y=plant["ucl"], line_dash="dash", line_color="#ef4444")
+                        fig.add_hline(y=plant["cl"], line_dash="dot", line_color="#f59e0b")
+                        fig.add_hline(y=plant["lcl"], line_dash="dash", line_color="#64748b")
+                    st.plotly_chart(_style_fig(fig), use_container_width=True)
+            elif spc.get("reason"):
+                st.caption(f"SPC skipped: {spc['reason']}")
+
+            cpk = qan.get("cpk") or {}
+            if cpk.get("ok"):
+                st.write("**Cp / Cpk lite**")
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Cp", cpk.get("cp"))
+                p2.metric("Cpk", cpk.get("cpk"))
+                p3.metric("LSL / USL", f"{cpk.get('lsl')} / {cpk.get('usl')}")
+                p4.metric("Mean", cpk.get("mean"))
+                by_cpk = cpk.get("by_line")
+                if isinstance(by_cpk, pd.DataFrame) and not by_cpk.empty:
+                    fig = px.bar(
+                        by_cpk,
+                        x="line_id",
+                        y=["cp", "cpk"],
+                        barmode="group",
+                        title=f"Capability by line ({cpk.get('measurement')})",
+                        color_discrete_sequence=["#94a3b8", "#f59e0b"],
+                    )
+                    st.plotly_chart(_style_fig(fig), use_container_width=True)
+                    st.dataframe(by_cpk, use_container_width=True)
+            else:
+                st.caption(cpk.get("reason") or "Cp/Cpk not available.")
+
+            frame = get_active_frame()
+            if frame is not None:
+                st.divider()
+                _render_chat_qa(frame, key_prefix="quality")
+
+
 # ── Insights ──────────────────────────────────────────────────────────────────
 elif page == "Insights":
     st.subheader("Insights")
@@ -567,7 +841,9 @@ elif page == "Insights":
         n_trials = st.slider("Optuna trials (forecast)", 5, 40, 15)
         use_optuna = st.checkbox("Enable Optuna hyperparameter tuning", value=True)
         if st.button("Generate manager insights", type="primary"):
-            insights = generate_insights(frame, st.session_state.downtime_df)
+            insights = generate_insights(
+                frame, st.session_state.downtime_df, st.session_state.quality_df
+            )
             st.session_state.insights = insights
             st.session_state.forecast = tune_and_forecast(
                 frame, n_trials=n_trials, use_optuna=use_optuna
@@ -636,18 +912,35 @@ elif page == "Reports":
 
         insights = st.session_state.get("insights")
         if not insights:
-            insights = generate_insights(frame, st.session_state.downtime_df)
+            insights = generate_insights(
+                frame, st.session_state.downtime_df, st.session_state.quality_df
+            )
             st.session_state.insights = insights
 
         plant_name = os.getenv("PLANT_NAME", "North Plant")
         pareto_rows = []
         reliability = {}
-        if st.session_state.downtime_df is not None:
+        maint = None
+        qual = None
+        if maint_frame_ok(st.session_state.downtime_df):
             try:
                 pareto_rows = downtime_pareto(st.session_state.downtime_df).to_dict("records")
             except Exception:
                 pareto_rows = []
             reliability = mttr_mtbf(st.session_state.downtime_df)
+            maint = analyze_maintenance(
+                st.session_state.downtime_df,
+                production=st.session_state.production_df,
+                oee_frame=frame,
+            )
+            _store_dept_analyses(maint=maint)
+        if quality_frame_ok(st.session_state.quality_df):
+            qual = analyze_quality(
+                st.session_state.quality_df,
+                oee_frame=frame,
+                production=st.session_state.production_df,
+            )
+            _store_dept_analyses(qual=qual)
 
         last_assistant = ""
         for msg in reversed(st.session_state.get("chat_history") or []):
@@ -662,6 +955,8 @@ elif page == "Reports":
             pareto_rows=pareto_rows,
             reliability=reliability,
             qa_answer=last_assistant[:1200],
+            maintenance=maint,
+            quality=qual,
         )
         st.session_state.last_report_html = html
         st.components.v1.html(html, height=520, scrolling=True)
@@ -690,6 +985,8 @@ elif page == "Reports":
                         "oee_plant": summary["plant"],
                         "insights": insights,
                         "pareto_rows": pareto_rows,
+                        "maintenance": maint,
+                        "quality": qual,
                     },
                     ROOT / "reports" / "output",
                 )

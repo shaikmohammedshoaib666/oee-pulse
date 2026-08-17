@@ -22,8 +22,10 @@ Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto dow
 | **Clean & Quality** | Industrial cleaning + statistical / ML quality checks |
 | **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns |
 | **Downtime Analysis** | Pareto of downtime codes, MTTR / MTBF lite, chronic machines |
+| **Maintenance** | Reliability overlay: asset risk, planned vs unplanned, inspect-this-week ranking, Availability hours lost |
+| **Quality** | SPC / scrap overlay: FPY, defect Pareto, I-MR control limits, Cp/Cpk lite, killer-line cards |
 | **Insights** | Manager language + Optuna forecast + LLM/offline Q&A (Gemini/OpenAI) |
-| **Reports** | HTML + PDF export, email brief (SMTP or demo disk save), automation notes |
+| **Reports** | HTML + PDF export, email brief (SMTP or demo disk save) including maint + quality when data exists |
 | **Persistence** | SQLite + CSV session store — recent sessions in sidebar, reload last session |
 
 ## Quick start (local)
@@ -99,13 +101,15 @@ modules/
   quality_checks.py    Industrial clean + quality report
   oee_engine.py        OEE math + aggregations
   downtime_analysis.py Pareto, MTTR/MTBF
+  maintenance_analysis.py Reliability risk, planned vs unplanned, inspect-this-week
+  quality_analysis.py  Scrap/FPY, defect Pareto, SPC lite, Cp/Cpk
   insights_engine.py   Manager insights + ask_oee_question (LLM/offline)
   optuna_tuner.py      Optional forecast / anomaly tuning
   reports.py           HTML / PDF / email brief
   sample_data.py       Synthetic multi-line plant CSVs
 ```
 
-**Data flow:** Production + Downtime + Quality → join → clean/QC → OEE → Pareto → insights / Q&A → report / email.
+**Data flow:** Production + Downtime + Quality → join → clean/QC → OEE cockpit → downtime / maintenance / quality overlays → insights / Q&A → report / email.
 
 ## Email automation MVP
 

@@ -16,12 +16,15 @@ from modules.config_secrets import (
     llm_status,
 )
 from modules.downtime_analysis import downtime_pareto, mttr_mtbf, top_chronic_machines
+from modules.maintenance_analysis import analyze_maintenance, frame_ok as maint_frame_ok
 from modules.oee_engine import oee_summary
+from modules.quality_analysis import analyze_quality, frame_ok as quality_frame_ok
 from modules.quality_checks import find_col
 
 SYSTEM_PROMPT = (
     "You are OEE Pulse, an Industry 4.0 co-pilot for plant managers. "
-    "Answer using the provided OEE, downtime Pareto, MTTR/MTBF, and line/machine metrics. "
+    "Answer using the provided OEE, downtime Pareto, MTTR/MTBF, maintenance risk, "
+    "quality scrap/FPY/SPC, and line/machine metrics. "
     "Use clear manager language. Be concise, actionable, and grounded in the numbers. "
     "Do not invent machines or percentages that are not in the context."
 )
@@ -30,6 +33,7 @@ SYSTEM_PROMPT = (
 def generate_insights(
     production_oee: pd.DataFrame,
     downtime: pd.DataFrame | None = None,
+    quality: pd.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
     """Return prioritized insights in plant-manager language."""
     insights: list[dict[str, Any]] = []
@@ -194,6 +198,23 @@ def generate_insights(
             }
         )
 
+    if maint_frame_ok(downtime):
+        try:
+            maint = analyze_maintenance(downtime, production=production_oee, oee_frame=production_oee)
+            for card in maint.get("cards") or []:
+                insights.append(card)
+        except Exception:
+            pass
+
+    if quality_frame_ok(quality) or quality_frame_ok(production_oee):
+        try:
+            qsrc = quality if quality_frame_ok(quality) else production_oee
+            qan = analyze_quality(qsrc, oee_frame=production_oee)
+            for card in qan.get("cards") or []:
+                insights.append(card)
+        except Exception:
+            pass
+
     order = {"high": 0, "medium": 1, "low": 2}
     insights.sort(key=lambda x: order.get(x["priority"], 9))
     return insights
@@ -203,6 +224,7 @@ def build_metrics_context(
     frame: pd.DataFrame,
     downtime: pd.DataFrame | None = None,
     insights: list[dict[str, Any]] | None = None,
+    quality: pd.DataFrame | None = None,
 ) -> str:
     """Compact grounded context for LLM / offline answers."""
     summary = oee_summary(frame)
@@ -248,6 +270,54 @@ def build_metrics_context(
     if insights:
         for i in insights[:6]:
             lines.append(f"Insight [{i.get('priority')}]: {i.get('message')}")
+
+    if maint_frame_ok(downtime):
+        try:
+            maint = analyze_maintenance(downtime, production=frame, oee_frame=frame)
+            hours = maint.get("hours_lost") or {}
+            if hours.get("narrative"):
+                lines.append(hours["narrative"])
+            inspect = maint.get("inspect_this_week")
+            if isinstance(inspect, pd.DataFrame) and not inspect.empty:
+                for _, r in inspect.head(4).iterrows():
+                    lines.append(
+                        f"Inspect {r.get('machine_id')} (line {r.get('line_id')}): "
+                        f"risk={float(r.get('remaining_risk', 0)):.0f} {r.get('why')}"
+                    )
+            pu = maint.get("planned_vs_unplanned") or {}
+            if pu.get("ok"):
+                lines.append(
+                    f"Planned downtime={pu.get('planned_min')} min "
+                    f"({float(pu.get('planned_pct') or 0)*100:.0f}%), "
+                    f"unplanned={pu.get('unplanned_min')} min"
+                )
+        except Exception:
+            pass
+
+    qsrc = quality if quality_frame_ok(quality) else frame
+    if quality_frame_ok(qsrc):
+        try:
+            qan = analyze_quality(qsrc, oee_frame=frame)
+            k = qan.get("kpis") or {}
+            if k:
+                lines.append(
+                    f"Scrap={float(k.get('scrap_rate') or 0)*100:.1f}% "
+                    f"FPY={float(k.get('fpy') or 0)*100:.1f}% "
+                    f"Quality OEE={float(k.get('quality_oee') or 0)*100:.1f}%"
+                )
+            pareto = qan.get("defect_pareto")
+            if isinstance(pareto, pd.DataFrame) and not pareto.empty:
+                for _, r in pareto.head(4).iterrows():
+                    lines.append(
+                        f"Defect '{r.get('defect_code')}': {float(r.get('rejects', 0)):.0f} rejects "
+                        f"({float(r.get('pct', 0))*100:.1f}%)"
+                    )
+            cpk = qan.get("cpk") or {}
+            if cpk.get("ok"):
+                lines.append(f"Cp={cpk.get('cp')} Cpk={cpk.get('cpk')} on {cpk.get('measurement')}")
+        except Exception:
+            pass
+
     return "\n".join(lines)
 
 
@@ -256,11 +326,12 @@ def _offline_answer(
     frame: pd.DataFrame,
     downtime: pd.DataFrame | None,
     insights: list[dict[str, Any]] | None,
+    quality: pd.DataFrame | None = None,
 ) -> str:
     q = (question or "").lower()
     summary = oee_summary(frame)
     plant = summary["plant"]
-    insight_list = insights or generate_insights(frame, downtime)
+    insight_list = insights or generate_insights(frame, downtime, quality)
 
     if any(w in q for w in ("oee", "overall equipment", "how are we", "plant status", "summary")):
         return (
@@ -271,6 +342,116 @@ def _offline_answer(
             f"Gap to 85% world-class: {summary['world_class_gap']*100:.1f} pts. "
             f"Top focus: {insight_list[0]['message'] if insight_list else 'improve weakest pillar.'}"
         )
+
+    quality_intent = any(
+        w in q
+        for w in (
+            "scrap",
+            "reject",
+            "fpy",
+            "first-pass",
+            "first pass",
+            "yield",
+            "defect",
+            "cpk",
+            "spc",
+            "control limit",
+            "killing quality",
+        )
+    ) or ("quality" in q and any(w in q for w in ("line", "worst", "which", "spc", "scrap")))
+    maint_intent = any(
+        w in q
+        for w in (
+            "inspect",
+            "remaining risk",
+            "unplanned",
+            "planned vs",
+            "hours lost",
+            "availability loss",
+            "maintenance",
+        )
+    )
+
+    if quality_intent:
+        qsrc = quality if quality_frame_ok(quality) else frame
+        try:
+            qan = analyze_quality(qsrc, oee_frame=frame)
+            k = qan.get("kpis") or {}
+            if any(w in q for w in ("scrap", "fpy", "yield", "reject")):
+                return (
+                    f"Scrap rate is {float(k.get('scrap_rate') or 0)*100:.1f}% "
+                    f"(first-pass yield {float(k.get('fpy') or 0)*100:.1f}%). "
+                    f"That is the Quality component of OEE "
+                    f"({float(k.get('quality_oee') or 0)*100:.1f}%). "
+                    f"{(qan.get('cards') or [{}])[0].get('message', '')}"
+                )
+            pareto = qan.get("defect_pareto")
+            if "defect" in q or "pareto" in q:
+                if isinstance(pareto, pd.DataFrame) and not pareto.empty:
+                    bits = [
+                        f"{r['defect_code']} ({float(r['pct'])*100:.0f}%, {float(r['rejects']):.0f} rejects)"
+                        for _, r in pareto.head(3).iterrows()
+                    ]
+                    note = " (codes synthesized)" if qan.get("defect_synthesized") else ""
+                    return "Top defects" + note + ": " + "; ".join(bits) + "."
+            cpk = qan.get("cpk") or {}
+            if any(w in q for w in ("cpk", "cp ", "spc", "control")):
+                spc = qan.get("spc") or {}
+                bits = []
+                if cpk.get("ok"):
+                    bits.append(
+                        f"Cpk={cpk.get('cpk')} Cp={cpk.get('cp')} on {cpk.get('measurement')} "
+                        f"(LSL {cpk.get('lsl')} / USL {cpk.get('usl')})."
+                    )
+                elif cpk.get("reason"):
+                    bits.append(str(cpk["reason"]))
+                if spc.get("ok"):
+                    plant_spc = spc.get("plant") or {}
+                    bits.append(
+                        f"SPC {spc.get('metric')} I-MR: CL={plant_spc.get('cl')}, "
+                        f"UCL={plant_spc.get('ucl')}, OOC={plant_spc.get('ooc_count', 0)}."
+                    )
+                if bits:
+                    return " ".join(bits)
+            cards = qan.get("cards") or []
+            if cards:
+                return cards[0].get("message", "Quality overlay unavailable.")
+        except Exception as exc:
+            return f"Quality overlay unavailable ({exc}). Load rejects / quality data."
+
+    if maint_intent and maint_frame_ok(downtime if downtime is not None else frame):
+        try:
+            maint = analyze_maintenance(
+                downtime if downtime is not None else frame,
+                production=frame,
+                oee_frame=frame,
+            )
+            if any(w in q for w in ("inspect", "remaining risk", "this week")):
+                inspect = maint.get("inspect_this_week")
+                if isinstance(inspect, pd.DataFrame) and not inspect.empty:
+                    bits = [
+                        f"{r.get('machine_id')} (risk {float(r.get('remaining_risk', 0)):.0f}: {r.get('why')})"
+                        for _, r in inspect.head(3).iterrows()
+                    ]
+                    return "Inspect this week: " + "; ".join(bits) + "."
+            if any(w in q for w in ("planned", "unplanned")):
+                pu = maint.get("planned_vs_unplanned") or {}
+                if pu.get("ok"):
+                    return (
+                        f"Planned downtime {float(pu.get('planned_min') or 0):.0f} min "
+                        f"({float(pu.get('planned_pct') or 0)*100:.0f}%) vs unplanned "
+                        f"{float(pu.get('unplanned_min') or 0):.0f} min "
+                        f"({float(pu.get('unplanned_pct') or 0)*100:.0f}%) "
+                        f"[{pu.get('source')} classification]."
+                    )
+            hours = maint.get("hours_lost") or {}
+            if hours.get("narrative") and any(w in q for w in ("hour", "availability", "lost")):
+                return hours["narrative"]
+            cards = maint.get("cards") or []
+            if cards:
+                return cards[0].get("message", "")
+        except Exception as exc:
+            return f"Maintenance overlay unavailable ({exc})."
 
     if any(w in q for w in ("downtime", "pareto", "stop", "changeover", "breakdown")):
         dt = downtime if downtime is not None else frame
@@ -346,7 +527,7 @@ def _offline_answer(
     return (
         "Here is a grounded plant briefing from current metrics:\n"
         f"{bullets}\n\n"
-        "Ask about OEE, downtime Pareto, MTTR/MTBF, worst line, or recommended actions."
+        "Ask about OEE, downtime Pareto, MTTR/MTBF, inspect this week, scrap/FPY, or recommended actions."
     )
 
 
@@ -405,11 +586,12 @@ def ask_oee_question(
     insights: list[dict[str, Any]] | None = None,
     history: Optional[list] = None,
     provider: str = "auto",
+    quality: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Answer plant-manager questions with Gemini/OpenAI or strong offline fallback."""
-    insight_list = insights or generate_insights(frame, downtime)
-    offline = _offline_answer(question, frame, downtime, insight_list)
-    context = build_metrics_context(frame, downtime, insight_list)
+    insight_list = insights or generate_insights(frame, downtime, quality)
+    offline = _offline_answer(question, frame, downtime, insight_list, quality)
+    context = build_metrics_context(frame, downtime, insight_list, quality)
     status = llm_status()
 
     provider = (provider or "auto").lower().strip()
@@ -448,7 +630,7 @@ def ask_oee_question(
             answer = _call_openai(question, context, history)
             source = "openai"
         # Keep a data check for metric-heavy questions
-        if any(w in question.lower() for w in ("oee", "mttr", "downtime", "%", "line")):
+        if any(w in question.lower() for w in ("oee", "mttr", "downtime", "%", "line", "scrap", "inspect")):
             answer = f"{answer}\n\n---\nData check:\n{offline}"
         return {"ok": True, "source": source, "answer": answer}
     except Exception as exc:

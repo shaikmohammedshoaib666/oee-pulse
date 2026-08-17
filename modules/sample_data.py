@@ -61,6 +61,8 @@ def generate_sample_plant(
                     rejects = int(total * scrap_rate)
                     good = total - rejects
 
+                    vib_mu = 6.4 if machine.endswith("03") else (4.8 if line == "L3" else 2.4)
+                    temp_mu = 63.0 if line == "L3" else 47.0
                     prod_rows.append(
                         {
                             "shift_date": day.date().isoformat(),
@@ -72,9 +74,21 @@ def generate_sample_plant(
                             "total_count": total,
                             "product_sku": rng.choice(["SKU-A", "SKU-B", "SKU-C", "SKU-D"]),
                             "operator_id": f"OP{rng.integers(10, 40)}",
+                            "vibration_rms": round(float(np.clip(rng.normal(vib_mu, 0.7), 0.4, 12.0)), 3),
+                            "temp_c": round(float(np.clip(rng.normal(temp_mu, 4.5), 30.0, 95.0)), 2),
+                            "motor_current_a": round(float(np.clip(rng.normal(12.5, 1.6), 6.0, 22.0)), 2),
                         }
                     )
 
+                    defect = str(rng.choice(["DIM", "SCRATCH", "CONTAM", "OTHER"]))
+                    defect_type = {
+                        "DIM": "Dimension out of spec",
+                        "SCRATCH": "Surface scratch",
+                        "CONTAM": "Contamination",
+                        "OTHER": "Other",
+                    }[defect]
+                    meas_mu = 10.18 if line == "L2" else 10.02
+                    meas_sd = 0.22 if line == "L2" else 0.11
                     q_rows.append(
                         {
                             "shift_date": day.date().isoformat(),
@@ -84,7 +98,11 @@ def generate_sample_plant(
                             "good_count": good,
                             "reject_count": rejects,
                             "scrap_rate": round(scrap_rate, 4),
-                            "defect_code": rng.choice(["DIM", "SCRATCH", "CONTAM", "OTHER"]),
+                            "defect_code": defect,
+                            "defect_type": defect_type,
+                            "measurement_mm": round(float(rng.normal(meas_mu, meas_sd)), 4),
+                            "lsl": 9.5,
+                            "usl": 10.5,
                         }
                     )
 
@@ -101,6 +119,7 @@ def generate_sample_plant(
                         start_hour = 6 if shift == "A" else 14
                         start_ts = day + pd.Timedelta(hours=int(start_hour + rng.integers(0, 7)), minutes=int(rng.integers(0, 50)))
                         end_ts = start_ts + pd.Timedelta(minutes=mins)
+                        is_planned = code in {"CHG01", "PM07"}
                         dt_rows.append(
                             {
                                 "event_id": event_id,
@@ -114,6 +133,8 @@ def generate_sample_plant(
                                 "start_time": start_ts.isoformat(),
                                 "end_time": end_ts.isoformat(),
                                 "planned_time_min": planned,
+                                "is_planned": bool(is_planned),
+                                "event_class": "Planned" if is_planned else "Unplanned",
                             }
                         )
                         event_id += 1

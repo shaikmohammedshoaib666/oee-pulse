@@ -40,6 +40,8 @@ META_KEYS = (
     "sample_loaded",
     "last_report_html",
     "schedule_note",
+    "maintenance_analysis",
+    "quality_analysis",
 )
 
 

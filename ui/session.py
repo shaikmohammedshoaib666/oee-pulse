@@ -10,6 +10,19 @@ import streamlit as st
 
 from modules import session_store
 
+
+def _analysis_for_meta(obj: Any) -> Any:
+    """Persist analysis dicts without DataFrame objects (session_store would drop them)."""
+    if obj is None:
+        return None
+    if isinstance(obj, pd.DataFrame):
+        return obj.head(250).to_dict("records")
+    if isinstance(obj, dict):
+        return {str(k): _analysis_for_meta(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_analysis_for_meta(v) for v in obj]
+    return obj
+
 DEFAULTS: dict[str, Any] = {
     "production_df": None,
     "downtime_df": None,
@@ -28,6 +41,8 @@ DEFAULTS: dict[str, Any] = {
     "session_title": "",
     "last_report_html": None,
     "clean_log": None,
+    "maintenance_analysis": None,
+    "quality_analysis": None,
     "_session_hydrated": False,
 }
 
@@ -105,6 +120,8 @@ def collect_meta() -> dict[str, Any]:
         "sample_loaded": bool(st.session_state.get("sample_loaded")),
         "last_report_html": st.session_state.get("last_report_html"),
         "schedule_note": st.session_state.get("schedule_note"),
+        "maintenance_analysis": _analysis_for_meta(st.session_state.get("maintenance_analysis")),
+        "quality_analysis": _analysis_for_meta(st.session_state.get("quality_analysis")),
     }
 
 
@@ -145,6 +162,8 @@ def load_persisted_session(session_id: str) -> bool:
         "sample_loaded",
         "last_report_html",
         "schedule_note",
+        "maintenance_analysis",
+        "quality_analysis",
     ):
         if key in meta and meta[key] is not None:
             st.session_state[key] = meta[key]
