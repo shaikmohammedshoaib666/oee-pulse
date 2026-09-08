@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import io
 import re
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
-
-import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from modules.data_integration import load_tabular_file, load_zip_tables, plant_default_join, try_duckdb_join
+from modules.data_integration import (
+    is_zip_upload,
+    load_tabular_file,
+    load_upload_for_kind,
+    load_zip_tables,
+    plant_default_join,
+    try_duckdb_join,
+)
 from modules.oee_engine import oee_summary
 from modules.quality_checks import clean_plant_frame
 from modules.url_ingest import (
@@ -43,6 +50,11 @@ def _assert_cloud_safe_contract() -> None:
     assert "_URL_INGEST_ERROR" in app
     assert "File upload" in app
     assert "Plant ZIP" in app
+    assert 'FILE_TYPES = ["csv", "xlsx", "tsv", "json", "parquet", "zip"]' in app
+    assert app.count("type=FILE_TYPES") >= 3
+    assert "up_prod" in app and "up_dt" in app and "up_q" in app
+    assert "load_upload_for_kind" in app
+    assert "_load_section_upload" in app
 
 
 def _assert_file_upload_still_works(sample_dir: Path) -> None:
@@ -64,6 +76,121 @@ def _assert_file_upload_still_works(sample_dir: Path) -> None:
     plant = oee_summary(cleaned)["plant"]
     assert 0 <= float(plant["oee"]) <= 1.5
     assert float(plant["availability"]) > 0
+
+    # Browse-box path: CSV still loads through the ZIP-aware helper.
+    prod2, meta2 = load_upload_for_kind(sample_dir / "production_logs.csv", "production")
+    assert meta2["kind"] == "file"
+    assert len(prod2) == len(prod)
+    assert "machine_id" in prod2.columns
+
+
+def _named_upload(name: str, data: bytes):
+    buf = io.BytesIO(data)
+    buf.name = name
+    buf.size = len(data)
+    return buf
+
+
+def _zip_bytes(members: list[tuple[str, Path]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for arcname, path in members:
+            zf.write(path, arcname)
+    return buf.getvalue()
+
+
+def _assert_section_zip_upload(sample_dir: Path) -> None:
+    """Each browse box accepts ZIP alongside CSV; a plant ZIP in one box does not clobber the others."""
+    prod_csv = (sample_dir / "production_logs.csv").read_bytes()
+    csv_upload = _named_upload("production_logs.csv", prod_csv)
+    assert is_zip_upload(csv_upload) is False
+    csv_df, csv_meta = load_upload_for_kind(csv_upload, "production")
+    assert csv_meta["kind"] == "file"
+    assert len(csv_df) > 50
+    # Same buffer can be read again after the ZIP sniff / rewind.
+    csv_upload.seek(0)
+    again, _ = load_upload_for_kind(csv_upload, "production")
+    assert len(again) == len(csv_df)
+
+    tsv_upload = _named_upload(
+        "production_logs.tsv",
+        csv_df.head(12).to_csv(index=False, sep="\t").encode("utf-8"),
+    )
+    tsv_df, tsv_meta = load_upload_for_kind(tsv_upload, "production")
+    assert tsv_meta["kind"] == "file" and len(tsv_df) == 12
+
+    json_upload = _named_upload(
+        "production_logs.json",
+        csv_df.head(8).to_json(orient="records", date_format="iso").encode("utf-8"),
+    )
+    json_df, json_meta = load_upload_for_kind(json_upload, "production")
+    assert json_meta["kind"] == "file" and len(json_df) == 8
+
+    plant_members = [
+        ("production_logs.csv", sample_dir / "production_logs.csv"),
+        ("downtime_events.csv", sample_dir / "downtime_events.csv"),
+        ("quality_rejects.csv", sample_dir / "quality_rejects.csv"),
+    ]
+    plant_zip = _zip_bytes(plant_members)
+    assert is_zip_upload(_named_upload("plant.zip", plant_zip)) is True
+    # Drive-style ZIP with no .zip suffix still sniffs as ZIP.
+    assert is_zip_upload(_named_upload("gdrive_file.bin", plant_zip)) is True
+
+    prod_zip, prod_meta = load_upload_for_kind(_named_upload("plant.zip", plant_zip), "production")
+    assert prod_meta["kind"] == "zip"
+    assert prod_meta["picked"] == "production"
+    assert set(prod_meta["zip_tables"]) == {"production", "downtime", "quality"}
+    assert len(prod_zip) == len(csv_df)
+    assert "planned_time_min" in prod_zip.columns or "total_count" in prod_zip.columns
+    assert "downtime_code" not in prod_zip.columns
+
+    dt_zip, dt_meta = load_upload_for_kind(_named_upload("plant.zip", plant_zip), "downtime")
+    assert dt_meta["picked"] == "downtime"
+    assert "event_id" in dt_zip.columns or "downtime_minutes" in dt_zip.columns
+    assert len(dt_zip) > 50
+
+    q_zip, q_meta = load_upload_for_kind(_named_upload("plant.zip", plant_zip), "quality")
+    assert q_meta["picked"] == "quality"
+    assert "reject_count" in q_zip.columns or "scrap_rate" in q_zip.columns
+    assert len(q_zip) > 50
+
+    # Single-file ZIP in the production box.
+    one = _zip_bytes([("production_logs.csv", sample_dir / "production_logs.csv")])
+    one_df, one_meta = load_upload_for_kind(_named_upload("prod_only.zip", one), "production")
+    assert one_meta["picked"] == "production" and len(one_df) == len(csv_df)
+
+    # Generic single-file ZIP still accepted as the section extract.
+    generic = _zip_bytes([("extract.csv", sample_dir / "production_logs.csv")])
+    generic_df, generic_meta = load_upload_for_kind(_named_upload("extract.zip", generic), "production")
+    assert len(generic_df) == len(csv_df)
+    assert generic_meta["kind"] == "zip"
+
+    # Downtime-only ZIP dropped in the production box: only one table, so it is used.
+    dt_only = _zip_bytes([("downtime_events.csv", sample_dir / "downtime_events.csv")])
+    fallback_df, fallback_meta = load_upload_for_kind(_named_upload("dt.zip", dt_only), "production")
+    assert fallback_meta["picked"] == "downtime"
+    assert len(fallback_df) == len(dt_zip)
+
+    # Two-file ZIP missing production must fail the production box (do not silently pick the wrong table).
+    dt_q = _zip_bytes(
+        [
+            ("downtime_events.csv", sample_dir / "downtime_events.csv"),
+            ("quality_rejects.csv", sample_dir / "quality_rejects.csv"),
+        ]
+    )
+    try:
+        load_upload_for_kind(_named_upload("dt_quality.zip", dt_q), "production")
+        raise AssertionError("mismatch ZIP should not load as production")
+    except ValueError as exc:
+        msg = str(exc).lower()
+        assert "not production" in msg or "no production" in msg
+        assert "plant zip" in msg
+
+    try:
+        load_upload_for_kind(_named_upload("plant.zip", plant_zip), "finance")
+        raise AssertionError("unknown table kind should fail")
+    except ValueError as exc:
+        assert "unknown table kind" in str(exc).lower()
 
 
 def _assert_drive_urls_and_sql_guards() -> None:
@@ -153,9 +280,6 @@ def _assert_app_source_guards() -> None:
 
 
 def _assert_zip_upload(sample_dir: Path) -> None:
-    import io
-    import zipfile
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.write(sample_dir / "production_logs.csv", "plant/production_logs.csv")
@@ -255,6 +379,7 @@ def _assert_zip_upload(sample_dir: Path) -> None:
 def run_regression(sample_dir: Path) -> None:
     _assert_cloud_safe_contract()
     _assert_file_upload_still_works(sample_dir)
+    _assert_section_zip_upload(sample_dir)
     _assert_zip_upload(sample_dir)
     _assert_drive_urls_and_sql_guards()
     _assert_sliced_ingest_feeds_oee(sample_dir)

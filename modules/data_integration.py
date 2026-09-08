@@ -61,7 +61,10 @@ _KIND_COLUMN_HINTS: dict[str, tuple[str, ...]] = {
 
 def load_tabular_file(uploaded_file) -> pd.DataFrame:
     """Load csv/tsv/xlsx/json into a DataFrame from a Streamlit UploadedFile or path."""
+    _rewind(uploaded_file)
     name = getattr(uploaded_file, "name", str(uploaded_file)).lower()
+    if name.endswith(".zip"):
+        raise ValueError("Use load_upload_for_kind() for ZIP archives.")
     if name.endswith((".xlsx", ".xls", ".xlsm")):
         return pd.read_excel(uploaded_file)
     if name.endswith(".json"):
@@ -281,6 +284,67 @@ def extract_zip_member_path(
             )
         tables = {table_kind: tables[table_kind]}
     return write_plant_tables_csv(tables, dest_dir)
+
+
+def is_zip_upload(uploaded) -> bool:
+    """True for .zip names, Drive-cached ZIP bytes, or a path that starts with PK."""
+    name = str(getattr(uploaded, "name", uploaded) or "").lower()
+    if name.endswith(".zip"):
+        return True
+    if isinstance(uploaded, (str, Path)):
+        return looks_like_zip_path(uploaded)
+    try:
+        if hasattr(uploaded, "getvalue"):
+            raw = uploaded.getvalue()
+            return looks_like_zip_bytes(raw[:8] if isinstance(raw, (bytes, bytearray)) else b"")
+        _rewind(uploaded)
+        head = uploaded.read(8)
+        _rewind(uploaded)
+        return looks_like_zip_bytes(head if isinstance(head, (bytes, bytearray)) else b"")
+    except Exception:
+        return False
+
+
+def load_upload_for_kind(uploaded, table_kind: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load one plant table from a CSV/Excel/JSON/Parquet file or a ZIP that contains it.
+
+    A three-file plant ZIP in the production box returns only production — it does
+    not overwrite downtime/quality. A ZIP with a single table is accepted as that
+    section's extract even if the filename is generic.
+    """
+    kind = (table_kind or "").lower()
+    if kind not in TABLE_KINDS:
+        raise ValueError(f"Unknown table kind: {table_kind!r}")
+    if is_zip_upload(uploaded):
+        tables, log = load_zip_tables(uploaded)
+        if kind in tables:
+            df = tables[kind]
+            picked = kind
+        elif len(tables) == 1:
+            picked, df = next(iter(tables.items()))
+        else:
+            found = ", ".join(tables) or "none"
+            raise ValueError(
+                f"ZIP has {found}, not {kind}. "
+                f"Use Plant ZIP to load all three, or include a {kind} file in this archive."
+            )
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            raise ValueError(f"ZIP has no {kind} rows.")
+        return df, {
+            "kind": "zip",
+            "picked": picked,
+            "zip_tables": list(tables),
+            "zip_log": log,
+            "zip_name": getattr(uploaded, "name", "upload.zip"),
+        }
+    _rewind(uploaded)
+    df = load_tabular_file(uploaded)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError(f"No {kind} rows in this upload.")
+    return df, {
+        "kind": "file",
+        "zip_name": getattr(uploaded, "name", ""),
+    }
 
 
 def suggest_join_keys(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:

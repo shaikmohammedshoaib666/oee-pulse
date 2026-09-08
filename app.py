@@ -24,7 +24,7 @@ from modules.column_mapping import (
 from modules.data_integration import (
     JOIN_TYPES,
     join_many,
-    load_tabular_file,
+    load_upload_for_kind,
     load_zip_tables,
     plant_default_join,
     suggest_join_keys,
@@ -262,6 +262,50 @@ def _render_mapping_editor(df: pd.DataFrame, table_kind: str) -> None:
             st.session_state.column_mappings = maps
             persist_current_session()
             st.success("Mapping saved — next upload for this plant reuses it.")
+
+
+def _upload_sig(uploaded, table_kind: str) -> tuple:
+    return (
+        table_kind,
+        getattr(uploaded, "name", ""),
+        getattr(uploaded, "size", None),
+        getattr(uploaded, "file_id", None),
+    )
+
+
+def _load_section_upload(uploaded, table_kind: str) -> None:
+    """Load CSV/Excel/JSON/Parquet/ZIP into one plant table, once per file."""
+    if uploaded is None:
+        return
+    sig_key = f"_upload_sig_{table_kind}"
+    sig = _upload_sig(uploaded, table_kind)
+    if st.session_state.get(sig_key) == sig:
+        return
+    try:
+        df, meta = load_upload_for_kind(uploaded, table_kind)
+        _apply_loaded_table(table_kind, df, meta, persist=True, reset_downstream=True)
+        st.session_state[sig_key] = sig
+        label = getattr(uploaded, "name", table_kind)
+        via = "ZIP" if meta.get("kind") == "zip" else "file"
+        st.success(f"Loaded **{table_kind}** from {via} **{label}** — {len(df):,} rows × {df.shape[1]} cols")
+        if meta.get("kind") == "zip" and meta.get("picked") and meta.get("picked") != table_kind:
+            st.warning(
+                f"This ZIP did not name a {table_kind} file; using the only table "
+                f"({meta.get('picked')}). Use Plant ZIP to load all three tables."
+            )
+        extras = [k for k in (meta.get("zip_tables") or []) if k != table_kind]
+        if extras:
+            st.caption(
+                f"ZIP also contains {', '.join(extras)} — not loaded in this box. "
+                "Use Plant ZIP above to load production + downtime + quality together."
+            )
+        if meta.get("zip_log"):
+            st.caption(
+                "ZIP members: "
+                + ", ".join(f"{m.get('member')} → {m.get('kind')}" for m in meta["zip_log"])
+            )
+    except Exception as exc:
+        st.error(f"{table_kind.title()} upload failed: {exc}")
 
 
 def _apply_loaded_table(
@@ -667,9 +711,10 @@ hero()
 if page == "Upload & Integrate":
     st.subheader("Upload & Integrate")
     st.write(
-        "Upload production logs, downtime events, and quality/rejects from files, a **plant ZIP**, "
-        "or a cloud link (Google Drive / HTTPS / Sheets). Large extracts (~2 GB) stream through DuckDB "
-        "so you can SQL-slice top / middle / bottom rows, between IDs, or between dates before OEE. "
+        "Each box accepts CSV / Excel / JSON / Parquet **or ZIP**. "
+        "Use **Plant ZIP** to load production + downtime + quality in one archive, "
+        "or a Drive/HTTPS link for large files. "
+        "DuckDB can SQL-slice top / middle / bottom rows, between IDs, or between dates before OEE. "
         "Map SAP-like headers once; the mapping is saved for this plant."
     )
 
@@ -714,20 +759,33 @@ if page == "Upload & Integrate":
                     st.error(f"ZIP upload failed: {exc}")
             else:
                 st.caption(f"Using ZIP **{getattr(up_zip, 'name', 'plant.zip')}** already loaded this session.")
+        FILE_TYPES = ["csv", "xlsx", "tsv", "json", "parquet", "zip"]
         c1, c2, c3 = st.columns(3)
         with c1:
-            up_prod = st.file_uploader("Production logs", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_prod")
+            up_prod = st.file_uploader(
+                "Production logs",
+                type=FILE_TYPES,
+                key="up_prod",
+                help="Browse CSV, XLSX, TSV, JSON, Parquet, or ZIP. A plant ZIP here loads only production.",
+            )
         with c2:
-            up_dt = st.file_uploader("Downtime codes / events", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_dt")
+            up_dt = st.file_uploader(
+                "Downtime codes / events",
+                type=FILE_TYPES,
+                key="up_dt",
+                help="Browse CSV, XLSX, TSV, JSON, Parquet, or ZIP. A plant ZIP here loads only downtime.",
+            )
         with c3:
-            up_q = st.file_uploader("Rejects / quality", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_q")
+            up_q = st.file_uploader(
+                "Rejects / quality",
+                type=FILE_TYPES,
+                key="up_q",
+                help="Browse CSV, XLSX, TSV, JSON, Parquet, or ZIP. A plant ZIP here loads only quality.",
+            )
 
-        if up_prod:
-            _apply_loaded_table("production", load_tabular_file(up_prod))
-        if up_dt:
-            _apply_loaded_table("downtime", load_tabular_file(up_dt))
-        if up_q:
-            _apply_loaded_table("quality", load_tabular_file(up_q))
+        _load_section_upload(up_prod, "production")
+        _load_section_upload(up_dt, "downtime")
+        _load_section_upload(up_q, "quality")
 
     with src_url:
         try:
