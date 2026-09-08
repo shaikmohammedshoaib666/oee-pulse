@@ -758,6 +758,8 @@ def friendly_source_label(meta: dict[str, Any]) -> str:
         return f"gdrive:{meta.get('gdrive_file_id', 'file')}"
     if kind == "local":
         return Path(meta.get("local_path") or meta.get("original_url") or "local").name
+    if kind in {"zip", "file"}:
+        return Path(str(meta.get("zip_name") or meta.get("original_url") or kind)).name
     if str(kind).startswith("kaggle"):
         return f"kaggle:{meta.get('kaggle_slug', 'dataset')}"
-    return urlparse(meta.get("original_url", "url")).netloc or "url"
+    return urlparse(meta.get("original_url") or "").netloc or str(meta.get("zip_name") or kind or "url")

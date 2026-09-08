@@ -70,12 +70,7 @@ def load_tabular_file(uploaded_file) -> pd.DataFrame:
     if name.endswith(".json"):
         return pd.read_json(uploaded_file)
     if name.endswith(".parquet"):
-        try:
-            return pd.read_parquet(uploaded_file)
-        except ImportError:
-            import duckdb
-
-            return duckdb.read_parquet(uploaded_file).df()
+        return _read_parquet(uploaded_file)
     if name.endswith(".tsv"):
         return pd.read_csv(uploaded_file, sep="\t")
     df = pd.read_csv(uploaded_file)
@@ -98,17 +93,79 @@ def _rewind(src) -> None:
             pass
 
 
+def _upload_basename(uploaded) -> str:
+    name = str(getattr(uploaded, "name", uploaded) or "").split("?")[0]
+    return Path(name).name.lower()
+
+
+def _read_bytes(src) -> bytes:
+    if isinstance(src, (str, Path)):
+        return Path(src).read_bytes()
+    if hasattr(src, "getvalue"):
+        raw = src.getvalue()
+        return bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+    _rewind(src)
+    raw = src.read()
+    _rewind(src)
+    return bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+
+
+def _read_parquet(src) -> pd.DataFrame:
+    """Read parquet via pandas if an engine exists, else DuckDB (Cloud has no pyarrow)."""
+    try:
+        _rewind(src)
+        return pd.read_parquet(src)
+    except Exception:
+        pass
+    import os
+    import tempfile
+
+    import duckdb
+
+    con = duckdb.connect(database=":memory:")
+    if isinstance(src, (str, Path)):
+        return con.execute("SELECT * FROM read_parquet(?)", [str(src)]).df()
+    raw = _read_bytes(src)
+    if not raw:
+        raise ValueError("Parquet file is empty.")
+    fd, path = tempfile.mkstemp(suffix=".parquet")
+    try:
+        os.write(fd, raw)
+        os.close(fd)
+        fd = None
+        return con.execute("SELECT * FROM read_parquet(?)", [path]).df()
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def looks_like_zip_bytes(head: bytes) -> bool:
     return any(head.startswith(magic) for magic in ZIP_MAGIC) or (len(head) >= 2 and head[:2] == b"PK")
 
 
 def looks_like_zip_path(path: PathLike) -> bool:
+    """True for plant ZIPs. Office Open XML (.xlsx) is also PK-zipped — do not treat it as a plant ZIP."""
     p = Path(str(path).split("?")[0])
-    if p.suffix.lower() == ".zip":
+    suf = p.suffix.lower()
+    if suf in TABULAR_SUFFIXES:
+        return False
+    if suf == ".zip":
         return True
     try:
         with p.open("rb") as fh:
-            return looks_like_zip_bytes(fh.read(8))
+            head = fh.read(8)
+        if not looks_like_zip_bytes(head):
+            return False
+        if _looks_like_office_workbook(p) and not _zip_contains_tabular(p):
+            return False
+        return True
     except OSError:
         return False
 
@@ -198,39 +255,24 @@ def load_zip_tables(zip_src) -> tuple[dict[str, pd.DataFrame], list[dict[str, An
             raise ValueError("ZIP has no CSV / Excel / JSON / Parquet files.")
         pending: list[tuple[str, pd.DataFrame]] = []
         for info in members:
-            if info.file_size and info.file_size > MAX_ZIP_MEMBER_BYTES:
-                log.append(
-                    {
-                        "member": info.filename,
-                        "rows": 0,
-                        "cols": 0,
-                        "kind": "skipped",
-                        "error": f"member larger than {MAX_ZIP_MEMBER_BYTES} bytes",
-                    }
-                )
-                continue
-            raw = zf.read(info)
-            if len(raw) > MAX_ZIP_MEMBER_BYTES:
-                log.append(
-                    {
-                        "member": info.filename,
-                        "rows": 0,
-                        "cols": 0,
-                        "kind": "skipped",
-                        "error": "uncompressed member too large",
-                    }
-                )
-                continue
-            name = Path(info.filename.replace("\\", "/")).name
             try:
+                if info.file_size and info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    raise ValueError(f"member larger than {MAX_ZIP_MEMBER_BYTES} bytes")
+                raw = zf.read(info)
+                if len(raw) > MAX_ZIP_MEMBER_BYTES:
+                    raise ValueError("uncompressed member too large")
+                name = Path(info.filename.replace("\\", "/")).name
                 df = load_tabular_file(_named_bytes(name, raw))
+                if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                    raise ValueError("no rows")
             except Exception as exc:
+                kind_label = "skipped" if "larger" in str(exc).lower() or "too large" in str(exc).lower() else "error"
                 log.append(
                     {
                         "member": info.filename,
                         "rows": 0,
                         "cols": 0,
-                        "kind": "error",
+                        "kind": kind_label,
                         "error": str(exc)[:200],
                     }
                 )
@@ -286,21 +328,55 @@ def extract_zip_member_path(
     return write_plant_tables_csv(tables, dest_dir)
 
 
+def _zip_namelist(uploaded) -> list[str]:
+    try:
+        src: Any
+        if isinstance(uploaded, (str, Path)):
+            src = Path(uploaded)
+        elif hasattr(uploaded, "getvalue"):
+            src = io.BytesIO(uploaded.getvalue())
+        else:
+            src = io.BytesIO(_read_bytes(uploaded))
+        with zipfile.ZipFile(src) as zf:
+            return [info.filename.replace("\\", "/").lower() for info in zf.infolist()]
+    except Exception:
+        return []
+
+
+def _looks_like_office_workbook(uploaded) -> bool:
+    """xlsx/xlsm are ZIP containers; a plant ZIP is not an Office workbook."""
+    names = _zip_namelist(uploaded)
+    return any(n == "[content_types].xml" or n.startswith("xl/") or "/xl/" in n for n in names)
+
+
+def _zip_contains_tabular(uploaded) -> bool:
+    names = _zip_namelist(uploaded)
+    return any(any(n.endswith(suf) for suf in TABULAR_SUFFIXES) for n in names)
+
+
 def is_zip_upload(uploaded) -> bool:
-    """True for .zip names, Drive-cached ZIP bytes, or a path that starts with PK."""
-    name = str(getattr(uploaded, "name", uploaded) or "").lower()
-    if name.endswith(".zip"):
+    """True for plant ZIP uploads. .xlsx is PK-zipped Office XML and must stay Excel."""
+    base = _upload_basename(uploaded)
+    if any(base.endswith(suf) for suf in TABULAR_SUFFIXES):
+        return False
+    if base.endswith(".zip"):
         return True
     if isinstance(uploaded, (str, Path)):
         return looks_like_zip_path(uploaded)
     try:
         if hasattr(uploaded, "getvalue"):
             raw = uploaded.getvalue()
-            return looks_like_zip_bytes(raw[:8] if isinstance(raw, (bytes, bytearray)) else b"")
-        _rewind(uploaded)
-        head = uploaded.read(8)
-        _rewind(uploaded)
-        return looks_like_zip_bytes(head if isinstance(head, (bytes, bytearray)) else b"")
+            head = raw[:8] if isinstance(raw, (bytes, bytearray)) else b""
+        else:
+            _rewind(uploaded)
+            head = uploaded.read(8)
+            _rewind(uploaded)
+            head = head if isinstance(head, (bytes, bytearray)) else b""
+        if not looks_like_zip_bytes(head):
+            return False
+        if _looks_like_office_workbook(uploaded) and not _zip_contains_tabular(uploaded):
+            return False
+        return True
     except Exception:
         return False
 

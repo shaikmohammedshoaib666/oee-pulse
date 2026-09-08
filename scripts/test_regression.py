@@ -18,6 +18,7 @@ from modules.data_integration import (
     load_tabular_file,
     load_upload_for_kind,
     load_zip_tables,
+    looks_like_zip_path,
     plant_default_join,
     try_duckdb_join,
 )
@@ -27,6 +28,7 @@ from modules.url_ingest import (
     build_preset_sql,
     detect_source_kind,
     extract_gdrive_file_id,
+    friendly_source_label,
     load_from_url,
     validate_ingest_sql,
 )
@@ -191,6 +193,68 @@ def _assert_section_zip_upload(sample_dir: Path) -> None:
         raise AssertionError("unknown table kind should fail")
     except ValueError as exc:
         assert "unknown table kind" in str(exc).lower()
+
+    # .xlsx is PK-zipped Office XML — browse boxes must load it as Excel, not a plant ZIP.
+    xlsx_buf = io.BytesIO()
+    csv_df.head(15).to_excel(xlsx_buf, index=False, engine="openpyxl")
+    xlsx_bytes = xlsx_buf.getvalue()
+    assert xlsx_bytes[:2] == b"PK"
+    xlsx_upload = _named_upload("production_logs.xlsx", xlsx_bytes)
+    assert is_zip_upload(xlsx_upload) is False
+    xlsx_df, xlsx_meta = load_upload_for_kind(xlsx_upload, "production")
+    assert xlsx_meta["kind"] == "file" and len(xlsx_df) == 15
+
+    xlsx_in_zip = io.BytesIO()
+    with zipfile.ZipFile(xlsx_in_zip, "w") as zf:
+        zf.writestr("production_logs.xlsx", xlsx_bytes)
+    xz_df, xz_meta = load_upload_for_kind(_named_upload("prod.zip", xlsx_in_zip.getvalue()), "production")
+    assert xz_meta["kind"] == "zip" and len(xz_df) == 15
+
+    with tempfile.TemporaryDirectory(prefix="oee-xlsx-") as tmp:
+        xlsx_path = Path(tmp) / "production_logs.xlsx"
+        xlsx_path.write_bytes(xlsx_bytes)
+        assert looks_like_zip_path(xlsx_path) is False
+        path_df, _ = load_upload_for_kind(xlsx_path, "production")
+        assert len(path_df) == 15
+        unnamed_xlsx = _named_upload("gdrive_file.bin", xlsx_bytes)
+        assert is_zip_upload(unnamed_xlsx) is False
+        xlsx_loaded, xlsx_url_meta = load_from_url(
+            str(xlsx_path), cache_dir=Path(tmp), table_kind="production"
+        )
+        assert len(xlsx_loaded) == 15
+        assert xlsx_url_meta.get("engine") == "pandas-excel"
+
+    # Parquet via DuckDB because Cloud has no pyarrow / fsspec.
+    import duckdb
+
+    with tempfile.TemporaryDirectory(prefix="oee-parquet-") as tmp:
+        pq_path = Path(tmp) / "production_logs.parquet"
+        con = duckdb.connect()
+        con.register("prod", csv_df.head(12))
+        con.execute("COPY prod TO ? (FORMAT PARQUET)", [str(pq_path)])
+        con.close()
+        assert is_zip_upload(pq_path) is False
+        pq_bytes = pq_path.read_bytes()
+        pq_df, pq_meta = load_upload_for_kind(_named_upload("production.parquet", pq_bytes), "production")
+        assert pq_meta["kind"] == "file" and len(pq_df) == 12
+        import pandas as pandas_mod
+
+        orig = pandas_mod.read_parquet
+
+        def _no_engine(*_a, **_k):
+            raise ImportError("Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'.")
+
+        pandas_mod.read_parquet = _no_engine
+        try:
+            forced, _ = load_upload_for_kind(_named_upload("production.parquet", pq_bytes), "production")
+            assert len(forced) == 12
+            from_path, _ = load_upload_for_kind(pq_path, "production")
+            assert len(from_path) == 12
+        finally:
+            pandas_mod.read_parquet = orig
+
+    assert friendly_source_label({"kind": "zip", "zip_name": "plant.zip"}) == "plant.zip"
+    assert friendly_source_label({"kind": "file", "zip_name": "production_logs.csv"}) == "production_logs.csv"
 
 
 def _assert_drive_urls_and_sql_guards() -> None:

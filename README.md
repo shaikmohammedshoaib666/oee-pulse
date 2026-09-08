@@ -18,7 +18,7 @@ Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto dow
 
 | Module | What it does |
 |--------|----------------|
-| **Upload & Integrate** | Multi-file upload, **plant ZIP**, or URL / Google Drive ingest. DuckDB streams ~2 GB Drive CSVs and **SQL-slices** (top / middle / bottom, between IDs, between dates, line / machine / shift) before pandas. SQL-style 3-table joins (pandas / DuckDB). **Saved column mapping**. **SAP-style extract templates** |
+| **Upload & Integrate** | Per-table **CSV / Excel / JSON / Parquet / ZIP** browse boxes, **plant ZIP**, or URL / Google Drive ingest. DuckDB streams ~2 GB Drive CSVs and **SQL-slices** (top / middle / bottom, between IDs, between dates, line / machine / shift) before pandas. SQL-style 3-table joins (pandas / DuckDB). **Saved column mapping**. **SAP-style extract templates** |
 | **Clean & Quality** | Industrial cleaning + statistical / ML quality checks |
 | **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns, **$ impact of lost hours**, **Availability hours \| $ lost \| PdM risk** |
 | **Downtime Analysis** | Pareto of downtime codes (minutes **and $**), MTTR / MTBF lite, chronic machines |

@@ -797,7 +797,17 @@ if page == "Upload & Integrate":
         meta = (st.session_state.get("url_ingest_meta") or {}).get(kind) or {}
         extra = ""
         if meta:
-            extra = f" · {friendly_source_label(meta)} · {meta.get('engine', '')}"
+            label = ""
+            if callable(friendly_source_label):
+                try:
+                    label = friendly_source_label(meta)
+                except Exception:
+                    label = ""
+            if not label:
+                label = str(meta.get("zip_name") or meta.get("kind") or "")
+            eng = str(meta.get("engine") or meta.get("kind") or "")
+            bits = " · ".join(b for b in (label, eng) if b)
+            extra = f" · {bits}" if bits else ""
         return f"{len(df):,} rows × {df.shape[1]} cols{extra}"
 
     tabs = st.tabs(["Production", "Downtime", "Quality", "Join", "Column mapping", "SAP templates"])
