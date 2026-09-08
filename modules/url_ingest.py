@@ -608,6 +608,46 @@ def _pandas_excel(path: str, row_limit: Optional[int] = None) -> pd.DataFrame:
     return df
 
 
+def _is_zip(path: str) -> bool:
+    return path.lower().split("?")[0].endswith(".zip")
+
+
+def _load_zip_resolved(
+    path: str,
+    *,
+    table_kind: Optional[str],
+    row_limit: Optional[int],
+    sql_query: Optional[str],
+    cache_dir: Path,
+    meta: dict[str, Any],
+    finish,
+):
+    from modules.data_integration import extract_zip_member_path, load_zip_tables
+
+    tables, zlog = load_zip_tables(path)
+    meta["zip_log"] = zlog
+    extra = {k: v for k, v in tables.items()}
+    chosen = table_kind if table_kind in extra else next(iter(extra))
+    extracted = extract_zip_member_path(path, Path(cache_dir) / "unzipped", table_kind=None)
+    meta["zip_paths"] = {k: str(p) for k, p in extracted.items()}
+    meta["zip_tables"] = list(extra.keys())
+    use_sql = bool((sql_query or "").strip())
+    read_path = str(extracted.get(chosen) or next(iter(extracted.values())))
+    extra.pop(chosen, None)
+    if use_sql:
+        df = _duckdb_read_sql(read_path, sql_query or "")
+        engine = "zip-duckdb-sql"
+    else:
+        df = _duckdb_read(read_path, row_limit=row_limit)
+        engine = "zip-duckdb"
+    if row_limit and row_limit > 0:
+        extra = {k: v.head(int(row_limit)).copy() for k, v in extra.items()}
+    else:
+        extra = {k: v.copy() for k, v in extra.items()}
+    meta["extra_tables"] = extra
+    return finish(df, engine)
+
+
 def load_from_url(
     url: str,
     *,
@@ -615,9 +655,10 @@ def load_from_url(
     row_limit: Optional[int] = None,
     force_cache: bool = False,
     sql_query: Optional[str] = None,
+    table_kind: Optional[str] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Load a tabular dataset from HTTPS, Google Drive, Kaggle, or a local path.
+    Load a tabular dataset from HTTPS, Google Drive, Kaggle, local path, or a plant ZIP.
 
     Large Drive files (hundreds of MB to ~2 GB) are streamed to disk, then DuckDB
     SQL-slices so pandas only sees the requested rows.
@@ -625,12 +666,16 @@ def load_from_url(
     fetch_target, meta = resolve_source_to_fetch_url(url)
     meta["row_limit"] = row_limit
     meta["sql_query"] = sql_query
+    meta["table_kind"] = table_kind
 
     def _finish(df: pd.DataFrame, engine: str) -> tuple[pd.DataFrame, dict[str, Any]]:
         df = _coerce_time_columns(df)
         drop = [c for c in ("_oee_rn", "_oee_n") if c in df.columns]
         if drop:
             df = df.drop(columns=drop)
+        extra = meta.get("extra_tables") or {}
+        if extra:
+            meta["extra_tables"] = {k: _coerce_time_columns(v) for k, v in extra.items()}
         meta["rows"] = len(df)
         meta["columns"] = list(df.columns)
         meta["engine"] = engine
@@ -641,6 +686,16 @@ def load_from_url(
 
     if meta.get("local_path"):
         local = str(Path(meta["local_path"]))
+        if _is_zip(local):
+            return _load_zip_resolved(
+                local,
+                table_kind=table_kind,
+                row_limit=row_limit,
+                sql_query=sql_query,
+                cache_dir=cache_dir,
+                meta=meta,
+                finish=_finish,
+            )
         low = local.lower()
         if low.endswith((".xlsx", ".xls", ".xlsm")):
             return _finish(_pandas_excel(local, row_limit=None if use_sql else row_limit), "pandas-excel")
@@ -651,7 +706,7 @@ def load_from_url(
     is_remote = fetch_target.startswith("http://") or fetch_target.startswith("https://")
     read_path = fetch_target
 
-    if use_sql or force_cache or meta.get("kind") == "google_drive":
+    if use_sql or force_cache or meta.get("kind") == "google_drive" or _is_zip(fetch_target):
         if is_remote:
             cached = _cache_remote_file(fetch_target, cache_dir, meta)
             meta["cached_path"] = str(cached)
@@ -666,6 +721,16 @@ def load_from_url(
             meta["cached_path"] = str(cached)
             read_path = str(cached)
 
+    if _is_zip(read_path):
+        return _load_zip_resolved(
+            read_path,
+            table_kind=table_kind,
+            row_limit=row_limit,
+            sql_query=sql_query,
+            cache_dir=cache_dir,
+            meta=meta,
+            finish=_finish,
+        )
     low = read_path.lower().split("?")[0]
     if low.endswith((".xlsx", ".xls", ".xlsm")):
         return _finish(_pandas_excel(read_path, row_limit=None if use_sql else row_limit), "pandas-excel")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -15,6 +17,44 @@ JOIN_TYPES = {
 }
 
 PathLike = Union[str, Path]
+TABULAR_SUFFIXES = (".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".json", ".parquet")
+TABLE_KINDS = ("production", "downtime", "quality")
+
+_KIND_NAME_HINTS: dict[str, tuple[str, ...]] = {
+    "downtime": (
+        "downtime",
+        "down_time",
+        "breakdown",
+        "sap_pm",
+        "_pm_",
+        "notification",
+        "unplanned",
+    ),
+    "quality": (
+        "quality",
+        "reject",
+        "scrap",
+        "sap_qm",
+        "_qm_",
+        "defect",
+        "inspection",
+    ),
+    "production": (
+        "production",
+        "prod_log",
+        "prodlog",
+        "sap_pp",
+        "_pp_",
+        "yield",
+        "output",
+        "confirm",
+    ),
+}
+_KIND_COLUMN_HINTS: dict[str, tuple[str, ...]] = {
+    "downtime": ("downtime_minutes", "downtime_code", "event_id", "auszt", "fecod"),
+    "quality": ("reject_count", "scrap_rate", "defect_code", "xmnga", "fehleranzahl"),
+    "production": ("planned_time_min", "ideal_rate", "total_count", "vgw02", "lmnnga", "gamng"),
+}
 
 
 def load_tabular_file(uploaded_file) -> pd.DataFrame:
@@ -43,6 +83,133 @@ def load_tabular_file(uploaded_file) -> pd.DataFrame:
 
 def load_path(path: PathLike) -> pd.DataFrame:
     return load_tabular_file(Path(path))
+
+
+def _zip_stem(name: str) -> str:
+    return Path(str(name).replace("\\", "/")).name.lower()
+
+
+def classify_plant_table(name: str, columns: Optional[list[str]] = None) -> Optional[str]:
+    """Guess production / downtime / quality from a filename and optional headers."""
+    stem = _zip_stem(name)
+    for kind, hints in _KIND_NAME_HINTS.items():
+        if any(h in stem for h in hints):
+            return kind
+    if columns:
+        cols = {str(c).strip().lower() for c in columns}
+        scores = {
+            kind: sum(1 for h in hints if h in cols)
+            for kind, hints in _KIND_COLUMN_HINTS.items()
+        }
+        best = max(scores, key=scores.get)
+        if scores[best] > 0:
+            return best
+    return None
+
+
+def _safe_zip_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    out: list[zipfile.ZipInfo] = []
+    for info in zf.infolist():
+        raw = info.filename.replace("\\", "/")
+        if info.is_dir() or raw.endswith("/"):
+            continue
+        parts = Path(raw).parts
+        if any(p in {".", ".."} or p.startswith("/") for p in parts):
+            raise ValueError(f"Unsafe zip path: {info.filename}")
+        base = Path(raw).name
+        if not base or base.startswith(".") or "__macosx" in raw.lower():
+            continue
+        if not any(base.lower().endswith(suf) for suf in TABULAR_SUFFIXES):
+            continue
+        out.append(info)
+    return out
+
+
+def _named_bytes(name: str, raw: bytes) -> io.BytesIO:
+    buf = io.BytesIO(raw)
+    buf.name = name
+    return buf
+
+
+def load_zip_tables(zip_src) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
+    """
+    Load a plant ZIP with production / downtime / quality extracts.
+
+    Members are classified by filename (production_logs.csv, sap_pm_downtime.csv, …)
+    then by column names if the filename is generic.
+    """
+    source = zip_src
+    if isinstance(zip_src, (str, Path)):
+        source = Path(zip_src)
+    try:
+        zf = zipfile.ZipFile(source)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Not a valid ZIP archive.") from exc
+
+    tables: dict[str, pd.DataFrame] = {}
+    log: list[dict[str, Any]] = []
+    with zf:
+        members = _safe_zip_members(zf)
+        if not members:
+            raise ValueError("ZIP has no CSV / Excel / JSON / Parquet files.")
+        pending: list[tuple[str, pd.DataFrame]] = []
+        for info in members:
+            raw = zf.read(info)
+            name = Path(info.filename.replace("\\", "/")).name
+            df = load_tabular_file(_named_bytes(name, raw))
+            kind = classify_plant_table(info.filename, list(df.columns))
+            pending.append((kind or "", df))
+            log.append(
+                {
+                    "member": info.filename,
+                    "rows": int(len(df)),
+                    "cols": int(df.shape[1]),
+                    "kind": kind or "unclassified",
+                }
+            )
+        unclassified = [(k, df) for k, df in pending if not k]
+        classified = [(k, df) for k, df in pending if k]
+        leftover_kinds = [k for k in TABLE_KINDS if k not in {x[0] for x in classified}]
+        for kind, df in classified:
+            if kind in tables:
+                # Keep the larger extract if two files map to the same table.
+                if len(df) > len(tables[kind]):
+                    tables[kind] = df
+            else:
+                tables[kind] = df
+        for df, kind in zip((x[1] for x in unclassified), leftover_kinds):
+            tables[kind] = df
+            for item in log:
+                if item["kind"] == "unclassified" and item["rows"] == len(df):
+                    item["kind"] = f"{kind} (by order)"
+                    break
+    if not tables:
+        raise ValueError("Could not classify any plant tables inside the ZIP.")
+    return tables, log
+
+
+def extract_zip_member_path(
+    zip_src,
+    dest_dir: Path,
+    *,
+    table_kind: Optional[str] = None,
+) -> dict[str, Path]:
+    """Extract classified plant tables from a ZIP onto disk (for DuckDB SQL slices)."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tables, _log = load_zip_tables(zip_src)
+    if table_kind:
+        if table_kind not in tables:
+            raise ValueError(
+                f"ZIP has no {table_kind} table. Found: {', '.join(tables) or 'none'}."
+            )
+        tables = {table_kind: tables[table_kind]}
+    out: dict[str, Path] = {}
+    for kind, df in tables.items():
+        path = dest_dir / f"{kind}.csv"
+        df.to_csv(path, index=False)
+        out[kind] = path
+    return out
 
 
 def suggest_join_keys(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:

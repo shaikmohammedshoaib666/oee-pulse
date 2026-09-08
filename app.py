@@ -25,6 +25,7 @@ from modules.data_integration import (
     JOIN_TYPES,
     join_many,
     load_tabular_file,
+    load_zip_tables,
     plant_default_join,
     suggest_join_keys,
     try_duckdb_join,
@@ -301,8 +302,9 @@ def _render_url_ingest() -> None:
         st.caption("File upload still works. Redeploy after `pip install requests duckdb`.")
         return
     st.caption(
-        "Paste a **direct HTTPS CSV/Parquet** link, a **Google Drive** share URL "
+        "Paste a **direct HTTPS CSV/Parquet/ZIP** link, a **Google Drive** share URL "
         "(Anyone with the link → Viewer), a **Google Sheet**, or a local path. "
+        "A plant ZIP auto-loads production / downtime / quality. "
         "Files up to ~2 GB stream to disk; DuckDB SQL-slices so pandas only gets the rows you ask for "
         "(top / middle / bottom, between IDs, between dates, line/machine/shift filters)."
     )
@@ -440,14 +442,24 @@ def _render_url_ingest() -> None:
                         row_limit=limit,
                         force_cache=force_cache or bool(sql),
                         sql_query=sql,
+                        table_kind=table_kind,
                     )
+                extra_tables = dict(meta.pop("extra_tables", {}) or {})
+                slim = {k: v for k, v in meta.items() if k != "extra_tables"}
                 _apply_loaded_table(
                     table_kind,
                     loaded,
-                    meta,
-                    persist=True,
+                    slim,
+                    persist=False,
                     reset_downstream=True,
                 )
+                zip_loaded = [table_kind]
+                for kind, extra_df in extra_tables.items():
+                    if kind == table_kind or not isinstance(extra_df, pd.DataFrame):
+                        continue
+                    _apply_loaded_table(kind, extra_df, {**slim, "zip_from": table_kind}, persist=False)
+                    zip_loaded.append(kind)
+                persist_current_session(title=st.session_state.get("session_title") or "ZIP loaded")
                 st.session_state.url_ingest_row_limit = int(row_limit or 0)
                 st.session_state.url_ingest_force_cache = force_cache
                 if sql_query is not None:
@@ -455,10 +467,16 @@ def _render_url_ingest() -> None:
                 eng = meta.get("engine", "duckdb")
                 cached = meta.get("cached_path")
                 extra = f" · cached `{Path(cached).name}`" if cached else ""
+                names = ", ".join(zip_loaded)
                 st.success(
-                    f"Loaded **{table_kind}** from **{friendly_source_label(meta)}** via **{eng}** — "
+                    f"Loaded **{names}** from **{friendly_source_label(meta)}** via **{eng}** — "
                     f"{len(loaded):,} rows × {loaded.shape[1]} cols{extra}"
                 )
+                if meta.get("zip_log"):
+                    st.caption("ZIP members: " + ", ".join(
+                        f"{m.get('member')} → {m.get('kind')} ({m.get('rows')} rows)"
+                        for m in meta["zip_log"]
+                    ))
                 if meta.get("stream_error"):
                     st.caption(f"Stream read fell back to disk cache: {str(meta['stream_error'])[:160]}")
             except Exception as exc:
@@ -646,14 +664,43 @@ hero()
 if page == "Upload & Integrate":
     st.subheader("Upload & Integrate")
     st.write(
-        "Upload production logs, downtime events, and quality/rejects from files **or** a cloud link "
-        "(Google Drive / HTTPS / Sheets). Large extracts (~2 GB) stream through DuckDB so you can SQL-slice "
-        "top / middle / bottom rows, between IDs, or between dates before OEE. "
+        "Upload production logs, downtime events, and quality/rejects from files, a **plant ZIP**, "
+        "or a cloud link (Google Drive / HTTPS / Sheets). Large extracts (~2 GB) stream through DuckDB "
+        "so you can SQL-slice top / middle / bottom rows, between IDs, or between dates before OEE. "
         "Map SAP-like headers once; the mapping is saved for this plant."
     )
 
     src_file, src_url = st.tabs(["File upload", "URL / Drive (DuckDB)"])
     with src_file:
+        up_zip = st.file_uploader(
+            "Plant ZIP (production + downtime + quality)",
+            type=["zip"],
+            key="up_zip",
+            help="One archive with files named like production_logs.csv, downtime_events.csv, quality_rejects.csv "
+            "(or SAP PP/PM/QM templates). Classifies by filename, then by columns.",
+        )
+        if up_zip:
+            try:
+                zip_tables, zip_log = load_zip_tables(up_zip)
+                for kind, zdf in zip_tables.items():
+                    _apply_loaded_table(
+                        kind,
+                        zdf,
+                        {"kind": "zip", "zip_name": getattr(up_zip, "name", "plant.zip")},
+                        persist=False,
+                        reset_downstream=True,
+                    )
+                persist_current_session(title=st.session_state.get("session_title") or "ZIP upload")
+                bits = ", ".join(
+                    f"{k} {len(v):,}×{v.shape[1]}" for k, v in zip_tables.items()
+                )
+                st.success(f"Loaded ZIP **{getattr(up_zip, 'name', 'plant.zip')}** — {bits}")
+                st.caption(
+                    "Members: "
+                    + ", ".join(f"{m.get('member')} → {m.get('kind')}" for m in zip_log)
+                )
+            except Exception as exc:
+                st.error(f"ZIP upload failed: {exc}")
         c1, c2, c3 = st.columns(3)
         with c1:
             up_prod = st.file_uploader("Production logs", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_prod")

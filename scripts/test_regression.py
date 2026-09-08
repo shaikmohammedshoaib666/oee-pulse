@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from modules.data_integration import load_tabular_file, plant_default_join, try_duckdb_join
+from modules.data_integration import load_tabular_file, load_zip_tables, plant_default_join, try_duckdb_join
 from modules.oee_engine import oee_summary
 from modules.quality_checks import clean_plant_frame
 from modules.url_ingest import (
@@ -151,9 +151,71 @@ def _assert_app_source_guards() -> None:
     assert "index=" not in table.group(1)
 
 
+def _assert_zip_upload(sample_dir: Path) -> None:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.write(sample_dir / "production_logs.csv", "plant/production_logs.csv")
+        zf.write(sample_dir / "downtime_events.csv", "nested/downtime_events.csv")
+        zf.write(sample_dir / "quality_rejects.csv", "quality_rejects.csv")
+        zf.writestr("__MACOSX/._junk.csv", "skip,me\n1,2\n")
+        zf.writestr("README.txt", "ignore me")
+    buf.seek(0)
+    tables, log = load_zip_tables(buf)
+    assert set(tables) == {"production", "downtime", "quality"}
+    assert len(tables["production"]) > 50
+    kinds = {m["kind"] for m in log if m["kind"] != "unclassified"}
+    assert "production" in kinds and "downtime" in kinds and "quality" in kinds
+
+    from modules.sap_templates import templates_zip_bytes
+
+    sap_tables, sap_log = load_zip_tables(io.BytesIO(templates_zip_bytes()))
+    assert set(sap_tables) >= {"production", "downtime", "quality"}
+    assert any("sap_pp" in (m.get("member") or "") for m in sap_log)
+
+    evil = io.BytesIO()
+    with zipfile.ZipFile(evil, "w") as zf:
+        zf.writestr("../escape.csv", "a,b\n1,2\n")
+    evil.seek(0)
+    try:
+        load_zip_tables(evil)
+        raise AssertionError("zip-slip path should be rejected")
+    except ValueError:
+        pass
+
+    named = io.BytesIO()
+    with zipfile.ZipFile(named, "w") as zf:
+        zf.write(sample_dir / "production_logs.csv", "plant.zip")  # not tabular suffix
+    named.seek(0)
+    # file named plant.zip inside zip is skipped; expect empty/error
+    try:
+        load_zip_tables(named)
+        raise AssertionError("non-tabular zip should fail")
+    except ValueError:
+        pass
+
+    with tempfile.TemporaryDirectory(prefix="oee-zip-") as tmp:
+        zpath = Path(tmp) / "plant.zip"
+        buf.seek(0)
+        zpath.write_bytes(buf.getvalue())
+        sliced, meta = load_from_url(
+            str(zpath),
+            cache_dir=Path(tmp),
+            table_kind="production",
+            sql_query=build_preset_sql("first_n_rows", {"n": 20}),
+        )
+        assert len(sliced) == 20
+        assert "production" in (meta.get("zip_tables") or [])
+        extra = meta.get("extra_tables") or {}
+        assert "downtime" in extra and "quality" in extra
+
+
 def run_regression(sample_dir: Path) -> None:
     _assert_cloud_safe_contract()
     _assert_file_upload_still_works(sample_dir)
+    _assert_zip_upload(sample_dir)
     _assert_drive_urls_and_sql_guards()
     _assert_sliced_ingest_feeds_oee(sample_dir)
     _assert_app_source_guards()
