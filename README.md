@@ -47,6 +47,8 @@ Smoke test:
 python scripts/smoke_test.py
 ```
 
+That run now also executes **regression** checks: previous file-upload → OEE still works, Drive/SQL slices still feed OEE, and Streamlit Cloud pins (`pandas 2.x`, Streamlit `<1.48`, Python 3.12) stay in place. GitHub Actions runs the same suite on Python 3.11 and 3.12 for every push to `main`.
+
 ## Streamlit Community Cloud
 
 Live app: [oee-pulse on Streamlit](https://shaikmohammedshoaib666-oee-pulse-app-haf428.streamlit.app)

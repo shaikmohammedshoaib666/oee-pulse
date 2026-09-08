@@ -40,6 +40,7 @@ from modules.url_ingest import (
     validate_ingest_sql,
 )
 from modules import session_store
+from scripts.test_regression import run_regression
 
 
 def _assert_no_df_or():
@@ -187,6 +188,7 @@ def main() -> None:
     prod, dt, qual = data["production"], data["downtime"], data["quality"]
     assert len(prod) > 50 and len(dt) > 50 and len(qual) > 50
     _assert_url_ingest(sample_dir)
+    run_regression(sample_dir)
     for col in ("vibration_rms", "temp_c", "motor_current_a"):
         assert col in prod.columns
     assert "finance_rates" in data and float(data["finance_rates"]["plant_usd_per_hour"]) > 0
@@ -384,7 +386,7 @@ def main() -> None:
     print(f"  qa_source={qa.get('source')} forecast_ok={forecast.get('ok')}")
     print(f"  html={html_path.name} pdf={pdf_path.name} email={Path(email['path']).name}")
     print(f"  session={sid} recent={len(recent)}")
-    print("  url_ingest=ok")
+    print("  url_ingest=ok regression=ok")
 
 
 if __name__ == "__main__":
