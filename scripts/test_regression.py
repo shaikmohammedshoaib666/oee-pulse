@@ -42,6 +42,7 @@ def _assert_cloud_safe_contract() -> None:
     assert "URL / Drive (DuckDB)" in app
     assert "_URL_INGEST_ERROR" in app
     assert "File upload" in app
+    assert "Plant ZIP" in app
 
 
 def _assert_file_upload_still_works(sample_dir: Path) -> None:
@@ -210,6 +211,45 @@ def _assert_zip_upload(sample_dir: Path) -> None:
         assert "production" in (meta.get("zip_tables") or [])
         extra = meta.get("extra_tables") or {}
         assert "downtime" in extra and "quality" in extra
+
+    # Rewind: same buffer can be opened twice.
+    buf.seek(0)
+    again, _ = load_zip_tables(buf)
+    assert set(again) == {"production", "downtime", "quality"}
+
+    # Magic-byte ZIP without a .zip suffix (Drive often caches as .csv).
+    buf.seek(0)
+    with tempfile.TemporaryDirectory(prefix="oee-zip-magic-") as tmp:
+        magic_path = Path(tmp) / "gdrive_file.bin"
+        magic_path.write_bytes(buf.getvalue())
+        sniffed, sniff_meta = load_from_url(
+            str(magic_path),
+            cache_dir=Path(tmp),
+            table_kind="downtime",
+            row_limit=8,
+        )
+        assert sniff_meta.get("engine", "").startswith("zip")
+        assert len(sniffed) == 8
+        assert "production" in (sniff_meta.get("extra_tables") or {})
+
+    # One corrupt member must not kill the rest of the archive.
+    mixed = io.BytesIO()
+    with zipfile.ZipFile(mixed, "w") as zf:
+        zf.write(sample_dir / "production_logs.csv", "production_logs.csv")
+        zf.writestr("downtime_events.csv", b"\xff\xfe not,a,csv")
+        zf.write(sample_dir / "quality_rejects.csv", "quality_rejects.csv")
+    mixed.seek(0)
+    mixed_tables, mixed_log = load_zip_tables(mixed)
+    assert "production" in mixed_tables and "quality" in mixed_tables
+    assert any(m.get("kind") == "error" for m in mixed_log)
+
+    # ZIP tables still run the original OEE path.
+    frame = tables["production"].merge(
+        tables["quality"], on=["shift_date", "shift", "line_id", "machine_id"], how="left"
+    )
+    cleaned, _ = clean_plant_frame(frame)
+    plant = oee_summary(cleaned)["plant"]
+    assert 0 <= float(plant["oee"]) <= 1.5
 
 
 def run_regression(sample_dir: Path) -> None:

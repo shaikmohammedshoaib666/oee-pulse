@@ -459,7 +459,10 @@ def _render_url_ingest() -> None:
                         continue
                     _apply_loaded_table(kind, extra_df, {**slim, "zip_from": table_kind}, persist=False)
                     zip_loaded.append(kind)
-                persist_current_session(title=st.session_state.get("session_title") or "ZIP loaded")
+                persist_current_session(
+                    title=st.session_state.get("session_title")
+                    or ("ZIP loaded" if extra_tables or meta.get("zip_tables") else f"{table_kind} loaded")
+                )
                 st.session_state.url_ingest_row_limit = int(row_limit or 0)
                 st.session_state.url_ingest_force_cache = force_cache
                 if sql_query is not None:
@@ -680,27 +683,37 @@ if page == "Upload & Integrate":
             "(or SAP PP/PM/QM templates). Classifies by filename, then by columns.",
         )
         if up_zip:
-            try:
-                zip_tables, zip_log = load_zip_tables(up_zip)
-                for kind, zdf in zip_tables.items():
-                    _apply_loaded_table(
-                        kind,
-                        zdf,
-                        {"kind": "zip", "zip_name": getattr(up_zip, "name", "plant.zip")},
-                        persist=False,
-                        reset_downstream=True,
+            zip_sig = (
+                "zip",
+                getattr(up_zip, "name", ""),
+                getattr(up_zip, "size", None),
+                getattr(up_zip, "file_id", None),
+            )
+            if st.session_state.get("_upload_sig_zip") != zip_sig:
+                try:
+                    zip_tables, zip_log = load_zip_tables(up_zip)
+                    for kind, zdf in zip_tables.items():
+                        _apply_loaded_table(
+                            kind,
+                            zdf,
+                            {"kind": "zip", "zip_name": getattr(up_zip, "name", "plant.zip")},
+                            persist=False,
+                            reset_downstream=True,
+                        )
+                    persist_current_session(title=st.session_state.get("session_title") or "ZIP upload")
+                    st.session_state._upload_sig_zip = zip_sig
+                    bits = ", ".join(
+                        f"{k} {len(v):,}×{v.shape[1]}" for k, v in zip_tables.items()
                     )
-                persist_current_session(title=st.session_state.get("session_title") or "ZIP upload")
-                bits = ", ".join(
-                    f"{k} {len(v):,}×{v.shape[1]}" for k, v in zip_tables.items()
-                )
-                st.success(f"Loaded ZIP **{getattr(up_zip, 'name', 'plant.zip')}** — {bits}")
-                st.caption(
-                    "Members: "
-                    + ", ".join(f"{m.get('member')} → {m.get('kind')}" for m in zip_log)
-                )
-            except Exception as exc:
-                st.error(f"ZIP upload failed: {exc}")
+                    st.success(f"Loaded ZIP **{getattr(up_zip, 'name', 'plant.zip')}** — {bits}")
+                    st.caption(
+                        "Members: "
+                        + ", ".join(f"{m.get('member')} → {m.get('kind')}" for m in zip_log)
+                    )
+                except Exception as exc:
+                    st.error(f"ZIP upload failed: {exc}")
+            else:
+                st.caption(f"Using ZIP **{getattr(up_zip, 'name', 'plant.zip')}** already loaded this session.")
         c1, c2, c3 = st.columns(3)
         with c1:
             up_prod = st.file_uploader("Production logs", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_prod")

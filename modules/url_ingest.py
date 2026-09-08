@@ -537,7 +537,9 @@ def _guess_cache_name(fetch_url: str, headers: dict[str, str], meta: dict[str, A
         if name:
             return Path(name).name
     if meta.get("gdrive_file_id"):
-        return f"gdrive_{meta['gdrive_file_id']}.csv"
+        ctype_hint = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+        ext = ".zip" if "zip" in ctype_hint else ".csv"
+        return f"gdrive_{meta['gdrive_file_id']}{ext}"
     parsed = urlparse(fetch_url)
     name = unquote(Path(parsed.path).name) or "remote_ingest.csv"
     if "." not in name:
@@ -561,9 +563,10 @@ def _cache_remote_file(fetch_url: str, dest_dir: Path, meta: dict[str, Any], *, 
     """Stream a remote file to disk so DuckDB can scan multi-GB sources without RAM blow-up."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     file_id = meta.get("gdrive_file_id")
-    reuse = dest_dir / f"gdrive_{file_id}.csv" if file_id else None
-    if reuse is not None and reuse.exists() and reuse.stat().st_size > 0:
-        return reuse
+    if file_id:
+        for cand in (dest_dir / f"gdrive_{file_id}.zip", dest_dir / f"gdrive_{file_id}.csv"):
+            if cand.exists() and cand.stat().st_size > 0:
+                return cand
 
     sess = _http().Session()
     urls_to_try = [fetch_url]
@@ -594,6 +597,12 @@ def _cache_remote_file(fetch_url: str, dest_dir: Path, meta: dict[str, Any], *, 
                     "Check sharing is 'Anyone with the link' (Viewer)."
                 )
                 continue
+            from modules.data_integration import looks_like_zip_path
+
+            if looks_like_zip_path(dest) and dest.suffix.lower() != ".zip":
+                zdest = dest.with_suffix(".zip")
+                dest.replace(zdest)
+                dest = zdest
             return dest
         except Exception as exc:
             last_err = exc
@@ -609,7 +618,11 @@ def _pandas_excel(path: str, row_limit: Optional[int] = None) -> pd.DataFrame:
 
 
 def _is_zip(path: str) -> bool:
-    return path.lower().split("?")[0].endswith(".zip")
+    from modules.data_integration import looks_like_zip_path
+
+    if path.lower().split("?")[0].endswith(".zip"):
+        return True
+    return looks_like_zip_path(path)
 
 
 def _load_zip_resolved(
@@ -622,13 +635,15 @@ def _load_zip_resolved(
     meta: dict[str, Any],
     finish,
 ):
-    from modules.data_integration import extract_zip_member_path, load_zip_tables
+    from modules.data_integration import load_zip_tables, write_plant_tables_csv
 
     tables, zlog = load_zip_tables(path)
+    if not tables:
+        raise ValueError("ZIP did not contain a usable production, downtime, or quality table.")
     meta["zip_log"] = zlog
-    extra = {k: v for k, v in tables.items()}
+    extra = {k: v.copy() for k, v in tables.items()}
     chosen = table_kind if table_kind in extra else next(iter(extra))
-    extracted = extract_zip_member_path(path, Path(cache_dir) / "unzipped", table_kind=None)
+    extracted = write_plant_tables_csv(tables, Path(cache_dir) / "unzipped")
     meta["zip_paths"] = {k: str(p) for k, p in extracted.items()}
     meta["zip_tables"] = list(extra.keys())
     use_sql = bool((sql_query or "").strip())
@@ -642,8 +657,6 @@ def _load_zip_resolved(
         engine = "zip-duckdb"
     if row_limit and row_limit > 0:
         extra = {k: v.head(int(row_limit)).copy() for k, v in extra.items()}
-    else:
-        extra = {k: v.copy() for k, v in extra.items()}
     meta["extra_tables"] = extra
     return finish(df, engine)
 

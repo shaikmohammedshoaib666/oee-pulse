@@ -19,6 +19,8 @@ JOIN_TYPES = {
 PathLike = Union[str, Path]
 TABULAR_SUFFIXES = (".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".json", ".parquet")
 TABLE_KINDS = ("production", "downtime", "quality")
+MAX_ZIP_MEMBER_BYTES = 512 * 1024 * 1024
+ZIP_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
 _KIND_NAME_HINTS: dict[str, tuple[str, ...]] = {
     "downtime": (
@@ -85,6 +87,40 @@ def load_path(path: PathLike) -> pd.DataFrame:
     return load_tabular_file(Path(path))
 
 
+def _rewind(src) -> None:
+    if hasattr(src, "seek"):
+        try:
+            src.seek(0)
+        except Exception:
+            pass
+
+
+def looks_like_zip_bytes(head: bytes) -> bool:
+    return any(head.startswith(magic) for magic in ZIP_MAGIC) or (len(head) >= 2 and head[:2] == b"PK")
+
+
+def looks_like_zip_path(path: PathLike) -> bool:
+    p = Path(str(path).split("?")[0])
+    if p.suffix.lower() == ".zip":
+        return True
+    try:
+        with p.open("rb") as fh:
+            return looks_like_zip_bytes(fh.read(8))
+    except OSError:
+        return False
+
+
+def write_plant_tables_csv(tables: dict[str, pd.DataFrame], dest_dir: Path) -> dict[str, Path]:
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+    for kind, df in tables.items():
+        path = dest_dir / f"{kind}.csv"
+        df.to_csv(path, index=False)
+        out[kind] = path
+    return out
+
+
 def _zip_stem(name: str) -> str:
     return Path(str(name).replace("\\", "/")).name.lower()
 
@@ -141,6 +177,11 @@ def load_zip_tables(zip_src) -> tuple[dict[str, pd.DataFrame], list[dict[str, An
     source = zip_src
     if isinstance(zip_src, (str, Path)):
         source = Path(zip_src)
+    elif hasattr(zip_src, "getvalue"):
+        source = io.BytesIO(zip_src.getvalue())
+    else:
+        _rewind(zip_src)
+        source = zip_src
     try:
         zf = zipfile.ZipFile(source)
     except zipfile.BadZipFile as exc:
@@ -154,9 +195,43 @@ def load_zip_tables(zip_src) -> tuple[dict[str, pd.DataFrame], list[dict[str, An
             raise ValueError("ZIP has no CSV / Excel / JSON / Parquet files.")
         pending: list[tuple[str, pd.DataFrame]] = []
         for info in members:
+            if info.file_size and info.file_size > MAX_ZIP_MEMBER_BYTES:
+                log.append(
+                    {
+                        "member": info.filename,
+                        "rows": 0,
+                        "cols": 0,
+                        "kind": "skipped",
+                        "error": f"member larger than {MAX_ZIP_MEMBER_BYTES} bytes",
+                    }
+                )
+                continue
             raw = zf.read(info)
+            if len(raw) > MAX_ZIP_MEMBER_BYTES:
+                log.append(
+                    {
+                        "member": info.filename,
+                        "rows": 0,
+                        "cols": 0,
+                        "kind": "skipped",
+                        "error": "uncompressed member too large",
+                    }
+                )
+                continue
             name = Path(info.filename.replace("\\", "/")).name
-            df = load_tabular_file(_named_bytes(name, raw))
+            try:
+                df = load_tabular_file(_named_bytes(name, raw))
+            except Exception as exc:
+                log.append(
+                    {
+                        "member": info.filename,
+                        "rows": 0,
+                        "cols": 0,
+                        "kind": "error",
+                        "error": str(exc)[:200],
+                    }
+                )
+                continue
             kind = classify_plant_table(info.filename, list(df.columns))
             pending.append((kind or "", df))
             log.append(
@@ -184,7 +259,9 @@ def load_zip_tables(zip_src) -> tuple[dict[str, pd.DataFrame], list[dict[str, An
                     item["kind"] = f"{kind} (by order)"
                     break
     if not tables:
-        raise ValueError("Could not classify any plant tables inside the ZIP.")
+        errs = [str(m.get("error")) for m in log if m.get("error")]
+        extra = f" Errors: {'; '.join(errs[:3])}" if errs else ""
+        raise ValueError("Could not classify any plant tables inside the ZIP." + extra)
     return tables, log
 
 
@@ -196,7 +273,6 @@ def extract_zip_member_path(
 ) -> dict[str, Path]:
     """Extract classified plant tables from a ZIP onto disk (for DuckDB SQL slices)."""
     dest_dir = Path(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
     tables, _log = load_zip_tables(zip_src)
     if table_kind:
         if table_kind not in tables:
@@ -204,12 +280,7 @@ def extract_zip_member_path(
                 f"ZIP has no {table_kind} table. Found: {', '.join(tables) or 'none'}."
             )
         tables = {table_kind: tables[table_kind]}
-    out: dict[str, Path] = {}
-    for kind, df in tables.items():
-        path = dest_dir / f"{kind}.csv"
-        df.to_csv(path, index=False)
-        out[kind] = path
-    return out
+    return write_plant_tables_csv(tables, dest_dir)
 
 
 def suggest_join_keys(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:
