@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any, Optional
 
 import pandas as pd
 import plotly.express as px
@@ -50,6 +51,14 @@ from modules.reports import (
 )
 from modules.sample_data import demo_finance_rates, ensure_demo_sensors, generate_sample_plant
 from modules.sap_templates import templates_zip_bytes
+from modules.url_ingest import (
+    TABLE_KINDS,
+    build_preset_sql,
+    default_ingest_sql,
+    friendly_source_label,
+    list_ingest_presets,
+    load_from_url,
+)
 from modules import session_store
 from ui.session import (
     append_chat,
@@ -66,6 +75,7 @@ from ui.theme import apply_theme, hero
 load_dotenv()
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DIR = ROOT / "sample_data"
+UPLOAD_DIR = ROOT / "data" / "uploads"
 
 st.set_page_config(
     page_title="OEE Pulse",
@@ -143,6 +153,8 @@ def load_sample_into_session() -> None:
     st.session_state.sample_loaded = True
     st.session_state.finance_rates = demo_finance_rates()
     st.session_state.column_mappings = st.session_state.get("column_mappings") or {}
+    st.session_state.url_ingest_meta = {}
+    st.session_state.url_ingest_sources = {}
     ensure_session_id()
     st.session_state.session_title = "Sample plant"
     persist_current_session(title="Sample plant")
@@ -241,6 +253,210 @@ def _render_mapping_editor(df: pd.DataFrame, table_kind: str) -> None:
             st.session_state.column_mappings = maps
             persist_current_session()
             st.success("Mapping saved — next upload for this plant reuses it.")
+
+
+def _apply_loaded_table(
+    table_kind: str,
+    raw: pd.DataFrame,
+    meta: Optional[dict[str, Any]] = None,
+    *,
+    persist: bool = False,
+    reset_downstream: bool = False,
+) -> None:
+    """Store a loaded plant table (file or URL) with mapping + optional ingest metadata."""
+    st.session_state[_raw_key(table_kind)] = raw
+    st.session_state[_work_key(table_kind)] = _map_uploaded(raw, table_kind)
+    metas = dict(st.session_state.get("url_ingest_meta") or {})
+    sources = dict(st.session_state.get("url_ingest_sources") or {})
+    if meta is not None:
+        metas[table_kind] = meta
+        sources[table_kind] = meta.get("original_url") or sources.get(table_kind, "")
+    else:
+        metas.pop(table_kind, None)
+    st.session_state.url_ingest_meta = metas
+    st.session_state.url_ingest_sources = sources
+    if reset_downstream:
+        st.session_state.sample_loaded = False
+        st.session_state.cleaned_df = None
+        st.session_state.oee_summary = None
+    if persist:
+        persist_current_session(title=st.session_state.get("session_title") or f"{table_kind} loaded")
+
+
+def _render_url_ingest() -> None:
+    """Forge-style URL / Google Drive ingest with DuckDB SQL slices for large files."""
+    st.caption(
+        "Paste a **direct HTTPS CSV/Parquet** link, a **Google Drive** share URL "
+        "(Anyone with the link → Viewer), a **Google Sheet**, or a local path. "
+        "Files up to ~2 GB stream to disk; DuckDB SQL-slices so pandas only gets the rows you ask for "
+        "(top / middle / bottom, between IDs, between dates, line/machine/shift filters)."
+    )
+    table_kind = st.selectbox(
+        "Load into table",
+        TABLE_KINDS,
+        index=TABLE_KINDS.index(st.session_state.get("url_ingest_table") or "production")
+        if (st.session_state.get("url_ingest_table") in TABLE_KINDS)
+        else 0,
+        format_func=lambda k: k.title(),
+        key="url_ingest_table_pick",
+    )
+    st.session_state.url_ingest_table = table_kind
+    sources = dict(st.session_state.get("url_ingest_sources") or {})
+    url_key = f"upload_url_input_{table_kind}"
+    if url_key not in st.session_state:
+        st.session_state[url_key] = sources.get(table_kind) or ""
+    url_val = st.text_input(
+        "Cloud data URL",
+        placeholder="https://drive.google.com/file/d/…/view   or   https://example.com/production.csv",
+        key=url_key,
+    )
+    ingest_mode = st.radio(
+        "Ingest mode",
+        ["Row limit (simple)", "SQL slice (DuckDB)"],
+        index=1 if st.session_state.get("url_ingest_mode") == "sql" else 0,
+        horizontal=True,
+        key="upload_url_ingest_mode",
+        help="For multi-GB plant extracts: SQL-slice (between IDs / dates / top-middle-bottom) before OEE.",
+    )
+    st.session_state.url_ingest_mode = "sql" if ingest_mode.startswith("SQL") else "limit"
+
+    row_limit = 0
+    sql_query: Optional[str] = None
+    if st.session_state.url_ingest_mode == "limit":
+        if "upload_url_row_limit" not in st.session_state:
+            st.session_state.upload_url_row_limit = int(st.session_state.get("url_ingest_row_limit") or 0)
+        row_limit = st.number_input(
+            "Row limit (0 = all rows — cap this on Streamlit Cloud for multi-GB files)",
+            min_value=0,
+            step=1000,
+            key="upload_url_row_limit",
+        )
+    else:
+        presets = list_ingest_presets()
+        preset_ids = [p["id"] for p in presets]
+        preset_labels = {p["id"]: p["label"] for p in presets}
+        cur_preset = st.session_state.get("url_ingest_preset") or preset_ids[0]
+        if cur_preset not in preset_ids:
+            cur_preset = preset_ids[0]
+        if "upload_url_sql_preset" not in st.session_state:
+            st.session_state.upload_url_sql_preset = cur_preset
+        preset_pick = st.selectbox(
+            "SQL preset",
+            preset_ids,
+            format_func=lambda pid: preset_labels.get(pid, pid),
+            key="upload_url_sql_preset",
+        )
+        picked = next(p for p in presets if p["id"] == preset_pick)
+        st.caption(picked.get("description") or "")
+        preset_params: dict[str, Any] = dict(st.session_state.get("url_ingest_preset_params") or {})
+        param_list = list(picked.get("params") or [])
+        param_cols = st.columns(min(3, max(1, len(param_list))) or 1)
+        for idx, (pname, plabel, pdefault, pkind) in enumerate(param_list):
+            pkey = f"upload_preset_{preset_pick}_{pname}"
+            with param_cols[idx % len(param_cols)]:
+                if pkind == "int":
+                    if pkey not in st.session_state:
+                        st.session_state[pkey] = int(preset_params.get(pname, pdefault) or pdefault)
+                    preset_params[pname] = st.number_input(
+                        plabel,
+                        min_value=0,
+                        step=max(1, int(pdefault) // 10) if int(pdefault or 0) > 10 else 1,
+                        key=pkey,
+                    )
+                elif pkind == "float":
+                    if pkey not in st.session_state:
+                        st.session_state[pkey] = float(preset_params.get(pname, pdefault) or pdefault)
+                    preset_params[pname] = st.number_input(
+                        plabel,
+                        min_value=0.1,
+                        max_value=100.0,
+                        step=0.5,
+                        key=pkey,
+                    )
+                else:
+                    if pkey not in st.session_state:
+                        st.session_state[pkey] = str(preset_params.get(pname, pdefault) or pdefault)
+                    preset_params[pname] = st.text_input(plabel, key=pkey)
+        if "upload_url_sql" not in st.session_state:
+            st.session_state.upload_url_sql = st.session_state.get("url_ingest_sql") or default_ingest_sql(table_kind)
+        if st.button("Apply preset to SQL", key="upload_apply_sql_preset"):
+            try:
+                sql = build_preset_sql(preset_pick, preset_params)
+                st.session_state.upload_url_sql = sql
+                st.session_state.url_ingest_sql = sql
+                st.session_state.url_ingest_preset = preset_pick
+                st.session_state.url_ingest_preset_params = preset_params
+                st.success(f"Applied **{preset_labels[preset_pick]}** template.")
+            except Exception as exc:
+                st.error(str(exc))
+        sql_query = st.text_area(
+            "DuckDB SQL (use `{source}` for the resolved file path/URL)",
+            height=170,
+            key="upload_url_sql",
+        )
+        st.caption(
+            "Examples: top `LIMIT 50000` · middle `row_number()` window · "
+            "`WHERE event_id BETWEEN 1000 AND 2000` · "
+            "`WHERE shift_date >= '2025-07-01' AND shift_date < '2025-07-15'` · "
+            "`WHERE machine_id = 'M101'`."
+        )
+
+    if "upload_url_force_cache" not in st.session_state:
+        st.session_state.upload_url_force_cache = bool(st.session_state.get("url_ingest_force_cache", True))
+    force_cache = st.checkbox(
+        "Always download to disk first (recommended for Google Drive / files > 100 MB / ~2 GB)",
+        key="upload_url_force_cache",
+    )
+    if st.button("Load from URL", key="upload_url_load", type="primary"):
+        if not (url_val or "").strip():
+            st.warning("Paste a URL first.")
+        else:
+            try:
+                with st.spinner("Resolving link and loading via DuckDB…"):
+                    limit = int(row_limit) if row_limit and row_limit > 0 else None
+                    sql = (sql_query or "").strip() if st.session_state.url_ingest_mode == "sql" else None
+                    loaded, meta = load_from_url(
+                        url_val.strip(),
+                        cache_dir=UPLOAD_DIR,
+                        row_limit=limit,
+                        force_cache=force_cache or bool(sql),
+                        sql_query=sql,
+                    )
+                _apply_loaded_table(
+                    table_kind,
+                    loaded,
+                    meta,
+                    persist=True,
+                    reset_downstream=True,
+                )
+                st.session_state.url_ingest_row_limit = int(row_limit or 0)
+                st.session_state.url_ingest_force_cache = force_cache
+                if sql_query is not None:
+                    st.session_state.url_ingest_sql = sql_query
+                eng = meta.get("engine", "duckdb")
+                cached = meta.get("cached_path")
+                extra = f" · cached `{Path(cached).name}`" if cached else ""
+                st.success(
+                    f"Loaded **{table_kind}** from **{friendly_source_label(meta)}** via **{eng}** — "
+                    f"{len(loaded):,} rows × {loaded.shape[1]} cols{extra}"
+                )
+                if meta.get("stream_error"):
+                    st.caption(f"Stream read fell back to disk cache: {str(meta['stream_error'])[:160]}")
+            except Exception as exc:
+                st.error(str(exc))
+
+    metas = st.session_state.get("url_ingest_meta") or {}
+    if metas:
+        bits = []
+        for kind in TABLE_KINDS:
+            meta = metas.get(kind)
+            if not meta:
+                continue
+            bits.append(
+                f"{kind}: {friendly_source_label(meta)} · {meta.get('rows', '?')} rows · {meta.get('engine', '')}"
+            )
+        if bits:
+            st.caption("URL sources — " + " | ".join(bits))
 
 
 def _render_chat_qa(frame: pd.DataFrame, key_prefix: str = "qa") -> None:
@@ -411,47 +627,56 @@ hero()
 if page == "Upload & Integrate":
     st.subheader("Upload & Integrate")
     st.write(
-        "Upload production logs, downtime events, and quality/rejects — or load synthetic plant data. "
+        "Upload production logs, downtime events, and quality/rejects from files **or** a cloud link "
+        "(Google Drive / HTTPS / Sheets). Large extracts (~2 GB) stream through DuckDB so you can SQL-slice "
+        "top / middle / bottom rows, between IDs, or between dates before OEE. "
         "Map SAP-like headers once; the mapping is saved for this plant."
     )
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        up_prod = st.file_uploader("Production logs", type=["csv", "xlsx", "tsv", "json"], key="up_prod")
-    with c2:
-        up_dt = st.file_uploader("Downtime codes / events", type=["csv", "xlsx", "tsv", "json"], key="up_dt")
-    with c3:
-        up_q = st.file_uploader("Rejects / quality", type=["csv", "xlsx", "tsv", "json"], key="up_q")
+    src_file, src_url = st.tabs(["File upload", "URL / Drive (DuckDB)"])
+    with src_file:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            up_prod = st.file_uploader("Production logs", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_prod")
+        with c2:
+            up_dt = st.file_uploader("Downtime codes / events", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_dt")
+        with c3:
+            up_q = st.file_uploader("Rejects / quality", type=["csv", "xlsx", "tsv", "json", "parquet"], key="up_q")
 
-    if up_prod:
-        raw = load_tabular_file(up_prod)
-        st.session_state.raw_production_df = raw
-        st.session_state.production_df = _map_uploaded(raw, "production")
-    if up_dt:
-        raw = load_tabular_file(up_dt)
-        st.session_state.raw_downtime_df = raw
-        st.session_state.downtime_df = _map_uploaded(raw, "downtime")
-    if up_q:
-        raw = load_tabular_file(up_q)
-        st.session_state.raw_quality_df = raw
-        st.session_state.quality_df = _map_uploaded(raw, "quality")
+        if up_prod:
+            _apply_loaded_table("production", load_tabular_file(up_prod))
+        if up_dt:
+            _apply_loaded_table("downtime", load_tabular_file(up_dt))
+        if up_q:
+            _apply_loaded_table("quality", load_tabular_file(up_q))
+
+    with src_url:
+        _render_url_ingest()
+
+    def _table_caption(kind: str, df: pd.DataFrame) -> str:
+        meta = (st.session_state.get("url_ingest_meta") or {}).get(kind) or {}
+        extra = ""
+        if meta:
+            extra = f" · {friendly_source_label(meta)} · {meta.get('engine', '')}"
+        return f"{len(df):,} rows × {df.shape[1]} cols{extra}"
 
     tabs = st.tabs(["Production", "Downtime", "Quality", "Join", "Column mapping", "SAP templates"])
     with tabs[0]:
         if st.session_state.production_df is not None:
             st.dataframe(st.session_state.production_df.head(100), use_container_width=True)
-            st.caption(f"{len(st.session_state.production_df)} rows")
+            st.caption(_table_caption("production", st.session_state.production_df))
         else:
             st.info("No production data yet.")
     with tabs[1]:
         if st.session_state.downtime_df is not None:
             st.dataframe(st.session_state.downtime_df.head(100), use_container_width=True)
-            st.caption(f"{len(st.session_state.downtime_df)} rows")
+            st.caption(_table_caption("downtime", st.session_state.downtime_df))
         else:
             st.info("No downtime data yet.")
     with tabs[2]:
         if st.session_state.quality_df is not None:
             st.dataframe(st.session_state.quality_df.head(100), use_container_width=True)
+            st.caption(_table_caption("quality", st.session_state.quality_df))
         else:
             st.info("No quality data yet.")
     with tabs[3]:

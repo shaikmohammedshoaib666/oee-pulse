@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
 import pandas as pd
 
@@ -28,6 +31,14 @@ from modules.quality_checks import build_quality_report, clean_plant_frame
 from modules.reports import build_html_brief, send_email_brief, write_html_report, write_pdf_report
 from modules.sample_data import generate_sample_plant
 from modules.sap_templates import TEMPLATE_MAPPINGS, production_template, templates_zip_bytes
+from modules.url_ingest import (
+    build_preset_sql,
+    detect_source_kind,
+    extract_gdrive_file_id,
+    list_ingest_presets,
+    load_from_url,
+    validate_ingest_sql,
+)
 from modules import session_store
 
 
@@ -45,6 +56,129 @@ def _assert_no_df_or():
     assert frame2 is integrated
 
 
+def _assert_url_ingest(sample_dir: Path) -> None:
+    """Drive URL parsing + DuckDB SQL slices on sample plant CSVs (no network)."""
+    drive = "https://drive.google.com/file/d/1AbCDefGhiJKLmnopQRstuVWxyz012345/view?usp=sharing"
+    assert detect_source_kind(drive) == "google_drive"
+    assert extract_gdrive_file_id(drive) == "1AbCDefGhiJKLmnopQRstuVWxyz012345"
+    assert extract_gdrive_file_id("https://drive.google.com/uc?id=abc123&export=download") == "abc123"
+    sheets = "https://docs.google.com/spreadsheets/d/sheetID99/edit#gid=0"
+    assert detect_source_kind(sheets) == "google_drive"
+    assert extract_gdrive_file_id(sheets) == "sheetID99"
+    assert detect_source_kind("https://example.com/plant.csv") == "https"
+
+    prod_path = sample_dir / "production_logs.csv"
+    dt_path = sample_dir / "downtime_events.csv"
+    assert prod_path.exists() and dt_path.exists()
+
+    with tempfile.TemporaryDirectory(prefix="oee-ingest-") as tmp:
+        cache = Path(tmp)
+
+        top_sql = build_preset_sql("first_n_rows", {"n": 25})
+        top, top_meta = load_from_url(str(prod_path), cache_dir=cache, sql_query=top_sql)
+        assert top_meta["kind"] == "local" and top_meta["engine"] == "duckdb-sql"
+        assert len(top) == 25
+        assert "machine_id" in top.columns
+
+        last_sql = build_preset_sql("last_n_rows", {"n": 10})
+        last, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=last_sql)
+        assert len(last) == 10
+
+        mid_sql = build_preset_sql("middle_n_rows", {"n": 20})
+        mid, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=mid_sql)
+        assert 1 <= len(mid) <= 21
+
+        rows_sql = build_preset_sql("between_row_numbers", {"start_row": 5, "end_row": 14})
+        window, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=rows_sql)
+        assert len(window) == 10
+
+        dates_sql = build_preset_sql(
+            "date_range",
+            {"start_date": "2025-07-01", "end_date": "2025-07-03", "ts_col": "shift_date"},
+        )
+        dated, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=dates_sql)
+        assert len(dated) > 0
+        assert dated["shift_date"].min() >= pd.Timestamp("2025-07-01")
+        assert dated["shift_date"].max() < pd.Timestamp("2025-07-03")
+
+        mach_sql = build_preset_sql("filter_machine_id", {"machine_id": "M101", "n": 0})
+        mach, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=mach_sql)
+        assert len(mach) > 0
+        assert set(mach["machine_id"].astype(str).unique()) == {"M101"}
+
+        line_sql = build_preset_sql("filter_line_id", {"line_id": "L1", "n": 0})
+        line, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=line_sql)
+        assert len(line) > 0
+        assert set(line["line_id"].astype(str).unique()) == {"L1"}
+
+        ids_sql = build_preset_sql(
+            "between_ids",
+            {"id_col": "event_id", "start_id": "1000", "end_id": "1010"},
+        )
+        ids, _ = load_from_url(str(dt_path), cache_dir=cache, sql_query=ids_sql)
+        assert len(ids) > 0
+        ev = pd.to_numeric(ids["event_id"], errors="coerce")
+        assert ev.min() >= 1000 and ev.max() <= 1010
+
+        sample_sql = build_preset_sql("sample_percent", {"sample_pct": 50})
+        sampled, _ = load_from_url(str(prod_path), cache_dir=cache, sql_query=sample_sql)
+        assert 0 < len(sampled) <= len(pd.read_csv(prod_path))
+
+        limited, lim_meta = load_from_url(str(prod_path), cache_dir=cache, row_limit=15)
+        assert len(limited) == 15 and lim_meta["engine"] == "duckdb"
+
+        class _DirHandler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(sample_dir), **kwargs)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _DirHandler)
+        thread = Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/production_logs.csv"
+            http_df, http_meta = load_from_url(
+                url,
+                cache_dir=cache,
+                force_cache=True,
+                sql_query=build_preset_sql("first_n_rows", {"n": 12}),
+            )
+            assert http_meta["kind"] == "https"
+            assert len(http_df) == 12
+            assert http_meta.get("cached_path")
+        finally:
+            httpd.shutdown()
+
+    presets = {p["id"] for p in list_ingest_presets()}
+    for pid in (
+        "first_n_rows",
+        "last_n_rows",
+        "middle_n_rows",
+        "between_row_numbers",
+        "between_ids",
+        "date_range",
+        "filter_line_id",
+        "sample_percent",
+    ):
+        assert pid in presets
+        sql = build_preset_sql(pid)
+        assert "{source}" in sql
+        validate_ingest_sql(sql)
+
+    try:
+        validate_ingest_sql("DROP TABLE production")
+        raise AssertionError("destructive SQL should be rejected")
+    except ValueError:
+        pass
+    try:
+        validate_ingest_sql("SELECT * FROM read_csv_auto('x.csv')")
+        raise AssertionError("missing {source} should be rejected")
+    except ValueError:
+        pass
+
+
 def main() -> None:
     _assert_no_df_or()
 
@@ -52,6 +186,7 @@ def main() -> None:
     data = generate_sample_plant(out_dir=sample_dir)
     prod, dt, qual = data["production"], data["downtime"], data["quality"]
     assert len(prod) > 50 and len(dt) > 50 and len(qual) > 50
+    _assert_url_ingest(sample_dir)
     for col in ("vibration_rms", "temp_c", "motor_current_a"):
         assert col in prod.columns
     assert "finance_rates" in data and float(data["finance_rates"]["plant_usd_per_hour"]) > 0
@@ -249,6 +384,7 @@ def main() -> None:
     print(f"  qa_source={qa.get('source')} forecast_ok={forecast.get('ok')}")
     print(f"  html={html_path.name} pdf={pdf_path.name} email={Path(email['path']).name}")
     print(f"  session={sid} recent={len(recent)}")
+    print("  url_ingest=ok")
 
 
 if __name__ == "__main__":

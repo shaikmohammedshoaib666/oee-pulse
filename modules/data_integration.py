@@ -20,10 +20,12 @@ PathLike = Union[str, Path]
 def load_tabular_file(uploaded_file) -> pd.DataFrame:
     """Load csv/tsv/xlsx/json into a DataFrame from a Streamlit UploadedFile or path."""
     name = getattr(uploaded_file, "name", str(uploaded_file)).lower()
-    if name.endswith((".xlsx", ".xls")):
+    if name.endswith((".xlsx", ".xls", ".xlsm")):
         return pd.read_excel(uploaded_file)
     if name.endswith(".json"):
         return pd.read_json(uploaded_file)
+    if name.endswith(".parquet"):
+        return pd.read_parquet(uploaded_file)
     if name.endswith(".tsv"):
         return pd.read_csv(uploaded_file, sep="\t")
     df = pd.read_csv(uploaded_file)

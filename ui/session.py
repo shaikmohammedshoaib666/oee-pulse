@@ -50,13 +50,30 @@ DEFAULTS: dict[str, Any] = {
     "raw_downtime_df": None,
     "raw_quality_df": None,
     "_session_hydrated": False,
+    "url_ingest_table": "production",
+    "url_ingest_sources": {},
+    "url_ingest_meta": {},
+    "url_ingest_mode": "sql",
+    "url_ingest_sql": "",
+    "url_ingest_preset": "first_n_rows",
+    "url_ingest_preset_params": {},
+    "url_ingest_row_limit": 100000,
+    "url_ingest_force_cache": True,
 }
+
+
+def _copy_default(value: Any) -> Any:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
 
 
 def init_session() -> None:
     for k, v in DEFAULTS.items():
         if k not in st.session_state:
-            st.session_state[k] = v if not isinstance(v, list) else list(v)
+            st.session_state[k] = _copy_default(v)
 
     if not st.session_state.get("email_to"):
         try:
@@ -81,7 +98,7 @@ def init_session() -> None:
 def reset_data(*, keep_email: bool = True) -> None:
     email = st.session_state.get("email_to", "")
     for k, v in DEFAULTS.items():
-        st.session_state[k] = v if not isinstance(v, list) else list(v)
+        st.session_state[k] = _copy_default(v)
     st.session_state._session_hydrated = True
     if keep_email:
         st.session_state.email_to = email

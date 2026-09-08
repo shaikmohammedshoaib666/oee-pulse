@@ -18,7 +18,7 @@ Upload messy plant CSVs → clean & quality-check → compute OEE → Pareto dow
 
 | Module | What it does |
 |--------|----------------|
-| **Upload & Integrate** | Multi-file upload (production, downtime, quality) + SQL-style 3-table joins (pandas / optional DuckDB). **Saved column mapping** (messy / SAP-like headers → canonical fields, reused next upload). **SAP-style extract templates** (PP/PM/QM CSV + README) |
+| **Upload & Integrate** | Multi-file upload (production, downtime, quality) **or URL / Google Drive ingest**. DuckDB streams ~2 GB Drive CSVs and **SQL-slices** (top / middle / bottom, between IDs, between dates, line / machine / shift) before pandas. SQL-style 3-table joins (pandas / DuckDB). **Saved column mapping** (messy / SAP-like headers → canonical fields). **SAP-style extract templates** |
 | **Clean & Quality** | Industrial cleaning + statistical / ML quality checks |
 | **OEE Cockpit** | Availability × Performance × Quality, plant / line / machine / shift breakdowns, **$ impact of lost hours**, **Availability hours \| $ lost \| PdM risk** |
 | **Downtime Analysis** | Pareto of downtime codes (minutes **and $**), MTTR / MTBF lite, chronic machines |
@@ -49,11 +49,27 @@ python scripts/smoke_test.py
 
 ## Streamlit Community Cloud
 
+Live app: [oee-pulse on Streamlit](https://shaikmohammedshoaib666-oee-pulse-app-haf428.streamlit.app)
+
 1. Push this repo to GitHub.
 2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
 3. Select the repo, branch `main`, main file `app.py`.
 4. Add secrets (see below) in **Settings → Secrets**.
 5. Redeploy after pushes to `main`.
+
+Drive files must be shared **Anyone with the link** (Viewer). On Streamlit Cloud, SQL-slice large files (do not load 2 GB into pandas).
+
+## URL / Drive ingest (DuckDB)
+
+On **Upload & Integrate → URL / Drive (DuckDB)**:
+
+1. Pick the target table (production, downtime, or quality).
+2. Paste a Google Drive share link, Google Sheet, direct HTTPS CSV/Parquet, or local path.
+3. Choose **SQL slice (DuckDB)** for large files.
+4. Apply a preset — top N, bottom N, middle N, between row numbers, between IDs, between dates, last N days, `machine_id` / `line_id` / `shift`, or random sample % — or edit the SQL. Always keep `{source}` in the query.
+5. Click **Load from URL**. DuckDB scans the cached file and only the slice lands in pandas for OEE.
+
+Share Drive files as **Anyone with the link**. Optional Kaggle links need `KAGGLE_USERNAME` + `KAGGLE_KEY`.
 
 ## Secrets / `.env`
 
@@ -79,6 +95,10 @@ PLANT_NAME = "North Plant"
 # OPENAI_API_KEY = "sk-..."
 # OPENAI_MODEL = "gpt-4o-mini"
 # AI_DEFAULT_PROVIDER = "gemini"
+
+# Optional Kaggle dataset ingest
+# KAGGLE_USERNAME = "..."
+# KAGGLE_KEY = "..."
 ```
 
 | Variable | Purpose |
@@ -88,6 +108,7 @@ PLANT_NAME = "North Plant"
 | `SMTP_*` | Real SMTP when demo mode is off |
 | `GEMINI_API_KEY` / `OPENAI_API_KEY` | LLM Q&A (offline fallback always works) |
 | `PLANT_NAME` | Sidebar / reports / saved column-mapping key |
+| `KAGGLE_USERNAME` / `KAGGLE_KEY` | Optional Kaggle dataset links on URL ingest |
 
 **In-app (not secrets):** sidebar **Lost-hour $ rates** — plant default `$ / hour`, optional `$ / good unit`, per-line rates, and a **Rates match finance** checkbox. Until that box is checked, dollar figures are labeled **management estimate**. Sample plant data ships with synthetic line rates (L1 $850 / L2 $1100 / L3 $720 per hour) and vibration / temp / current columns.
 
@@ -100,6 +121,7 @@ modules/
   config_secrets.py    Env + Streamlit secrets
   session_store.py     SQLite metadata + CSV frames under data/sessions/
   data_integration.py  Multi-file load + chained joins
+  url_ingest.py        Google Drive / HTTPS / Kaggle ingest + DuckDB SQL slices
   quality_checks.py    Industrial clean + quality report
   oee_engine.py        OEE math + aggregations
   column_mapping.py    Saved SAP/messy → canonical field mapping
