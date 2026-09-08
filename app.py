@@ -51,15 +51,23 @@ from modules.reports import (
 )
 from modules.sample_data import demo_finance_rates, ensure_demo_sensors, generate_sample_plant
 from modules.sap_templates import templates_zip_bytes
-from modules.url_ingest import (
-    TABLE_KINDS,
-    build_preset_sql,
-    default_ingest_sql,
-    friendly_source_label,
-    list_ingest_presets,
-    load_from_url,
-)
 from modules import session_store
+
+try:
+    from modules.url_ingest import (
+        TABLE_KINDS,
+        build_preset_sql,
+        default_ingest_sql,
+        friendly_source_label,
+        list_ingest_presets,
+        load_from_url,
+    )
+    _URL_INGEST_ERROR = ""
+except Exception as _url_ingest_exc:  # pragma: no cover - Cloud import guard
+    TABLE_KINDS = ("production", "downtime", "quality")
+    build_preset_sql = default_ingest_sql = friendly_source_label = None  # type: ignore[assignment]
+    list_ingest_presets = load_from_url = None  # type: ignore[assignment]
+    _URL_INGEST_ERROR = str(_url_ingest_exc)
 from ui.session import (
     append_chat,
     ensure_session_id,
@@ -285,18 +293,25 @@ def _apply_loaded_table(
 
 def _render_url_ingest() -> None:
     """Forge-style URL / Google Drive ingest with DuckDB SQL slices for large files."""
+    if _URL_INGEST_ERROR or load_from_url is None:
+        st.error(
+            "URL / Drive ingest is unavailable in this environment: "
+            f"{_URL_INGEST_ERROR or 'loader not imported'}"
+        )
+        st.caption("File upload still works. Redeploy after `pip install requests duckdb`.")
+        return
     st.caption(
         "Paste a **direct HTTPS CSV/Parquet** link, a **Google Drive** share URL "
         "(Anyone with the link → Viewer), a **Google Sheet**, or a local path. "
         "Files up to ~2 GB stream to disk; DuckDB SQL-slices so pandas only gets the rows you ask for "
         "(top / middle / bottom, between IDs, between dates, line/machine/shift filters)."
     )
+    if "url_ingest_table_pick" not in st.session_state:
+        current = st.session_state.get("url_ingest_table") or "production"
+        st.session_state.url_ingest_table_pick = current if current in TABLE_KINDS else "production"
     table_kind = st.selectbox(
         "Load into table",
         TABLE_KINDS,
-        index=TABLE_KINDS.index(st.session_state.get("url_ingest_table") or "production")
-        if (st.session_state.get("url_ingest_table") in TABLE_KINDS)
-        else 0,
         format_func=lambda k: k.title(),
         key="url_ingest_table_pick",
     )
@@ -310,10 +325,14 @@ def _render_url_ingest() -> None:
         placeholder="https://drive.google.com/file/d/…/view   or   https://example.com/production.csv",
         key=url_key,
     )
+    ingest_options = ["Row limit (simple)", "SQL slice (DuckDB)"]
+    if "upload_url_ingest_mode" not in st.session_state:
+        st.session_state.upload_url_ingest_mode = (
+            ingest_options[1] if st.session_state.get("url_ingest_mode") == "sql" else ingest_options[0]
+        )
     ingest_mode = st.radio(
         "Ingest mode",
-        ["Row limit (simple)", "SQL slice (DuckDB)"],
-        index=1 if st.session_state.get("url_ingest_mode") == "sql" else 0,
+        ingest_options,
         horizontal=True,
         key="upload_url_ingest_mode",
         help="For multi-GB plant extracts: SQL-slice (between IDs / dates / top-middle-bottom) before OEE.",
@@ -651,7 +670,10 @@ if page == "Upload & Integrate":
             _apply_loaded_table("quality", load_tabular_file(up_q))
 
     with src_url:
-        _render_url_ingest()
+        try:
+            _render_url_ingest()
+        except Exception as exc:
+            st.error(f"URL / Drive ingest failed: {exc}")
 
     def _table_caption(kind: str, df: pd.DataFrame) -> str:
         meta = (st.session_state.get("url_ingest_meta") or {}).get(kind) or {}

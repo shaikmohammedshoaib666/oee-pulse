@@ -25,7 +25,12 @@ def load_tabular_file(uploaded_file) -> pd.DataFrame:
     if name.endswith(".json"):
         return pd.read_json(uploaded_file)
     if name.endswith(".parquet"):
-        return pd.read_parquet(uploaded_file)
+        try:
+            return pd.read_parquet(uploaded_file)
+        except ImportError:
+            import duckdb
+
+            return duckdb.read_parquet(uploaded_file).df()
     if name.endswith(".tsv"):
         return pd.read_csv(uploaded_file, sep="\t")
     df = pd.read_csv(uploaded_file)

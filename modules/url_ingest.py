@@ -11,7 +11,11 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pandas as pd
-import requests
+
+def _http():
+    import requests
+
+    return requests
 
 USER_AGENT = (
     "Mozilla/5.0 (compatible; OEEPulse/1.0; "
@@ -397,9 +401,9 @@ def _coerce_time_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def resolve_gdrive_download_url(file_id: str, session: Optional[requests.Session] = None) -> str:
+def resolve_gdrive_download_url(file_id: str, session: Any = None) -> str:
     """Return a direct-download URL, handling Google's large-file confirm token."""
-    sess = session or requests.Session()
+    sess = session or _http().Session()
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     resp = sess.get(base, stream=True, timeout=60, allow_redirects=True, headers=REQUEST_HEADERS)
     resp.raise_for_status()
@@ -561,7 +565,7 @@ def _cache_remote_file(fetch_url: str, dest_dir: Path, meta: dict[str, Any], *, 
     if reuse is not None and reuse.exists() and reuse.stat().st_size > 0:
         return reuse
 
-    sess = requests.Session()
+    sess = _http().Session()
     urls_to_try = [fetch_url]
     if file_id:
         urls_to_try.extend(

@@ -51,6 +51,8 @@ python scripts/smoke_test.py
 
 Live app: [oee-pulse on Streamlit](https://shaikmohammedshoaib666-oee-pulse-app-haf428.streamlit.app)
 
+If Community Cloud shows **Oh no. Error running app**, open **Manage app → Settings → Advanced** and set **Python 3.12**, then reboot. `runtime.txt` is ignored on Community Cloud.
+
 1. Push this repo to GitHub.
 2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
 3. Select the repo, branch `main`, main file `app.py`.
